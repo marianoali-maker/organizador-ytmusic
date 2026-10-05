@@ -225,13 +225,12 @@ def lookup_lastfm(artist, track):
 # ==========================================
 # INTERFAZ PRINCIPAL DE LA APP
 # ==========================================
-col_logo, col_title = st.columns([1, 5])
-with col_logo:
-    st.markdown("<h1 style='color: #FF0000; margin:0;'>🔴</h1>",
-                unsafe_allow_html=True)
-with col_title:
-    st.markdown("<h1 style='margin:0;'>YouTube Music Organizer</h1>",
-                unsafe_allow_html=True)
+st.markdown("""
+<div style="display: flex; align-items: center; gap: 16px; margin-bottom: 8px;">
+    <img src="https://upload.wikimedia.org/wikipedia/commons/6/6a/Youtube_Music_icon.svg" width="48" height="48" alt="YouTube Music Logo"/>
+    <h1 style="margin: 0; font-size: 2.2rem; line-height: 1.2;">YouTube Music Organizer</h1>
+</div>
+""", unsafe_allow_html=True)
 
 st.write("Clasificá automáticamente tu biblioteca y 'Me gusta' en playlists privadas ordenadas por género musical.")
 st.markdown("---")
@@ -277,7 +276,6 @@ if not st.session_state["yt_credentials"]:
             if st.button("✅ Ya ingresé el código"):
                 token_data = poll_device_token(info["device_code"])
                 if "access_token" in token_data:
-                    # Formatear credenciales para ytmusicapi
                     creds = {
                         "access_token": token_data["access_token"],
                         "refresh_token": token_data.get("refresh_token", ""),
