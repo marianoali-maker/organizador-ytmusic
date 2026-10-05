@@ -1,0 +1,9 @@
+oauth.json
+browser.json
+headers_auth.json
+headers.txt
+genre_cache.json
+__pycache__/
+dist/
+build/
+*.spec
