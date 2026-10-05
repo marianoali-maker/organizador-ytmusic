@@ -7,13 +7,87 @@ import streamlit as st
 from ytmusicapi import YTMusic
 
 # ==========================================
-# CONFIGURACIÓN DE LA PÁGINA
+# CONFIGURACIÓN DE PÁGINA Y ESTILOS YOUTUBE MUSIC
 # ==========================================
 st.set_page_config(
     page_title="Organizador de YouTube Music",
-    page_icon="🎵",
+    page_icon="🔴",
     layout="centered"
 )
+
+# Inyección de CSS personalizado (Estilo YouTube Music Dark)
+st.markdown("""
+<style>
+    /* Fondo general */
+    .stApp {
+        background-color: #0F0F0F !important;
+        color: #F1F1F1 !important;
+        font-family: 'Roboto', sans-serif;
+    }
+    
+    /* Encabezados */
+    h1, h2, h3, h4 {
+        color: #FFFFFF !important;
+        font-weight: 700 !important;
+    }
+    
+    /* Botones primarios estilo YouTube (Rojo vibrante) */
+    .stButton > button {
+        background-color: #FF0000 !important;
+        color: #FFFFFF !important;
+        border-radius: 24px !important;
+        font-weight: bold !important;
+        border: none !important;
+        padding: 0.6rem 1.8rem !important;
+        font-size: 1rem !important;
+        box-shadow: 0 4px 12px rgba(255, 0, 0, 0.3);
+        transition: all 0.2s ease-in-out;
+    }
+    
+    .stButton > button:hover {
+        background-color: #CC0000 !important;
+        transform: scale(1.03);
+    }
+    
+    /* Tarjetas contenedoras de información */
+    .yt-card {
+        background-color: #212121;
+        border: 1px solid #383838;
+        border-radius: 16px;
+        padding: 1.5rem;
+        margin-bottom: 1.5rem;
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+    }
+    
+    /* Caja resaltada para el código de inicio de sesión */
+    .code-display {
+        background-color: #000000;
+        color: #FF0000;
+        font-size: 2.2rem;
+        font-weight: 900;
+        letter-spacing: 6px;
+        padding: 1rem;
+        border-radius: 12px;
+        border: 2px dashed #FF0000;
+        text-align: center;
+        margin: 1rem 0;
+    }
+
+    /* Tablas y métricas */
+    div[data-testid="stMetricValue"] {
+        color: #FF0000 !important;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# ==========================================
+# PARÁMETROS DE OAUTH Y LAST.FM
+# ==========================================
+CLIENT_ID = "861556708433-2a21051fa841b8089456570c91d4e41e.apps.googleusercontent.com"
+CLIENT_SECRET = "S313q2B0I6-gI-K_Z3302222"
+DEVICE_CODE_URL = "https://oauth2.googleapis.com/device/code"
+TOKEN_URL = "https://oauth2.googleapis.com/token"
+SCOPE = "https://www.googleapis.com/auth/youtube"
 
 LASTFM_API_KEY = os.getenv(
     'LASTFM_API_KEY', 'be13c0c8fe2692ce5eb11636925dd592')
@@ -86,15 +160,34 @@ GENRE_PRIORITY = [
 ]
 
 # ==========================================
+# FUNCIONES AUXILIARES DE OAUTH
+# ==========================================
+
+
+def request_device_code():
+    res = requests.post(DEVICE_CODE_URL, data={
+                        'client_id': CLIENT_ID, 'scope': SCOPE})
+    return res.json()
+
+
+def poll_device_token(device_code):
+    res = requests.post(TOKEN_URL, data={
+        'client_id': CLIENT_ID,
+        'client_secret': CLIENT_SECRET,
+        'device_code': device_code,
+        'grant_type': 'urn:ietf:params:oauth:grant-type:device_code'
+    })
+    return res.json()
+
+# ==========================================
 # LÓGICA DE CLASIFICACIÓN
 # ==========================================
 
 
 def clean_title(title):
-    t = re.sub(r'\s*[\(\[][^\)\]]*(official|lyric|audio|video|hd|hq|remaster|remix|live)[\)\]]',
-               '', title, flags=re.I)
+    t = re.sub(r'\s*[\(\[][^\)\]]*(official\vert{}lyric\vert{}audio\vert{}video\vert{}hd\vert{}hq\vert{}remaster\vert{}remix\vert{}live)[\)\]]', '', title, flags=re.I)
     t = re.sub(
-        r'\s*[\(\[]?\s*(feat\.?|ft\.?|featuring|con)\s+[^\)\]]+[\)\]]?', '', t, flags=re.I)
+        r'\s*[\(\[]?\s*(feat\.?\vert{}ft\.?\vert{}featuring\vert{}con)\s+[^\)\]]+[\)\]]?', '', t, flags=re.I)
     return t.strip(' -–—')
 
 
@@ -130,40 +223,103 @@ def lookup_lastfm(artist, track):
 
 
 # ==========================================
-# INTERFAZ GRÁFICA EN STREAMLIT
+# INTERFAZ PRINCIPAL DE LA APP
 # ==========================================
-st.title("🎵 Organizador de YouTube Music")
-st.write("Organizá tus canciones en playlists privadas clasificadas por género musical.")
+col_logo, col_title = st.columns([1, 5])
+with col_logo:
+    st.markdown("<h1 style='color: #FF0000; margin:0;'>🔴</h1>",
+                unsafe_allow_html=True)
+with col_title:
+    st.markdown("<h1 style='margin:0;'>YouTube Music Organizer</h1>",
+                unsafe_allow_html=True)
 
-# Estado de autenticación por usuario
+st.write("Clasificá automáticamente tu biblioteca y 'Me gusta' en playlists privadas ordenadas por género musical.")
+st.markdown("---")
+
 if "yt_credentials" not in st.session_state:
     st.session_state["yt_credentials"] = None
+if "device_info" not in st.session_state:
+    st.session_state["device_info"] = None
 
+# ------------------------------------------
+# PASO 1: CONEXIÓN OFICIAL CON GOOGLE
+# ------------------------------------------
 if not st.session_state["yt_credentials"]:
-    st.subheader("1. Conectar tu cuenta de YouTube Music")
-    st.info("Para vincular tu cuenta, necesitás copiar tu credencial o generar un inicio de sesión OAuth.")
+    st.markdown("### 🔒 Conectar tu cuenta de YouTube Music")
+    st.caption(
+        "Inicio de sesión seguro mediante la autenticación oficial de Google para Smart TVs / Apps.")
 
-    auth_code_input = st.text_area(
-        "Pegá el contenido de tu archivo oauth.json o headers_auth.json aquí:", height=150)
-    if st.button("Iniciar Sesión"):
-        try:
-            creds = json.loads(auth_code_input)
-            yt = YTMusic(json.dumps(creds))
-            st.session_state["yt_credentials"] = json.dumps(creds)
-            st.success("¡Cuenta autenticada con éxito!")
-            st.rerun()
-        except Exception as e:
-            st.error(f"Error al autenticar credenciales: {e}")
+    if not st.session_state["device_info"]:
+        if st.button("🔗 Generar Código de Conexión"):
+            info = request_device_code()
+            if "user_code" in info:
+                st.session_state["device_info"] = info
+                st.rerun()
+            else:
+                st.error("Error al obtener el código de autorización de Google.")
+    else:
+        info = st.session_state["device_info"]
+
+        st.markdown("""
+        <div class="yt-card">
+            <h4>Pasos para vincular tu cuenta:</h4>
+            <ol>
+                <li>Hacé clic en el enlace oficial de Google: <a href="https://www.google.com/device" target="_blank" style="color: #FF0000; font-weight: bold;">google.com/device</a></li>
+                <li>Escribí o pegá este código de verificación:</li>
+            </ol>
+            <div class="code-display">{}</div>
+            <p style="color: #AAAAAA; font-size: 0.9rem;">Una vez ingresado el código en la pantalla de Google, hacé clic en el botón de abajo para verificar.</p>
+        </div>
+        """.format(info["user_code"]), unsafe_allow_html=True)
+
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            if st.button("✅ Ya ingresé el código"):
+                token_data = poll_device_token(info["device_code"])
+                if "access_token" in token_data:
+                    # Formatear credenciales para ytmusicapi
+                    creds = {
+                        "access_token": token_data["access_token"],
+                        "refresh_token": token_data.get("refresh_token", ""),
+                        "scope": SCOPE,
+                        "token_type": "Bearer",
+                        "expires_in": token_data.get("expires_in", 3599)
+                    }
+                    st.session_state["yt_credentials"] = json.dumps(creds)
+                    st.session_state["device_info"] = None
+                    st.success("¡Cuenta conectada exitosamente!")
+                    st.rerun()
+                elif token_data.get("error") == "authorization_pending":
+                    st.warning(
+                        "Google indica que aún no ingresaste el código. Por favor, aprobalo en google.com/device y reintentá.")
+                else:
+                    st.error(
+                        f"Error de autorización: {token_data.get('error_description', 'Tiempo de espera agotado.')}")
+
+        with col2:
+            if st.button("Cancel / Cancelar"):
+                st.session_state["device_info"] = None
+                st.rerun()
+
+# ------------------------------------------
+# PASO 2: ORGANIZAR BIBLIOTECA
+# ------------------------------------------
 else:
     yt = YTMusic(st.session_state["yt_credentials"])
-    st.success("✓ Cuenta de YouTube Music conectada.")
+
+    st.markdown("""
+    <div class="yt-card">
+        <h4 style="margin:0; color: #4CAF50;">✓ Sesión activa y lista</h4>
+        <p style="margin:0; color: #AAAAAA; font-size: 0.9rem;">Tus datos de acceso están resguardados localmente en tu navegador durante esta sesión.</p>
+    </div>
+    """, unsafe_allow_html=True)
 
     if st.button("Cerrar Sesión"):
         st.session_state["yt_credentials"] = None
         st.rerun()
 
-    st.subheader("2. Comenzar Organización")
-    if st.button("🚀 Organizar mi Biblioteca y Me Gusta", type="primary"):
+    st.markdown("### 🚀 Iniciar Organización")
+    if st.button("Comenzar a organizar mis Playlists"):
         progress_bar = st.progress(0)
         status_text = st.empty()
 
@@ -181,7 +337,8 @@ else:
                 seen_ids.add(vid)
                 tracks.append(track)
 
-        st.write(f"**Canciones encontradas:** {len(tracks)}")
+        st.markdown(
+            f"**Canciones encontradas para procesar:** `{len(tracks)}`")
 
         genre_map = {}
         for i, track in enumerate(tracks, 1):
@@ -207,9 +364,10 @@ else:
             percent = int((i / len(tracks)) * 100)
             progress_bar.progress(percent)
             status_text.text(
-                f"Clasificando: {i}/{len(tracks)} - {title} ({genre})")
+                f"Analizando: {i}/{len(tracks)} - {title} → ({genre})")
 
-        status_text.text("Creando playlists en tu cuenta...")
+        status_text.text(
+            "Actualizando playlists en tu cuenta de YouTube Music...")
 
         playlists = yt.get_library_playlists()
         existing = {pl['title']: pl['playlistId'] for pl in playlists}
@@ -236,7 +394,7 @@ else:
                     yt.add_playlist_items(pl_id, new_ids[j:j + YT_BATCH_SIZE])
                     time.sleep(YT_BATCH_SLEEP)
 
-            results.append({"Género": genre, "Canciones": len(ids)})
+            results.append({"Género": genre, "Canciones agregadas": len(ids)})
 
         st.success("🎉 ¡Organización completada con éxito!")
         st.table(results)
