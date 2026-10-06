@@ -83,8 +83,6 @@ st.markdown("""
 # ==========================================
 # PARÁMETROS DE OAUTH Y LAST.FM
 # ==========================================
-CLIENT_ID = "861556708433-2a21051fa841b8089456570c91d4e41e.apps.googleusercontent.com"
-CLIENT_SECRET = "S313q2B0I6-gI-K_Z3302222"
 DEVICE_CODE_URL = "https://oauth2.googleapis.com/device/code"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 SCOPE = "https://www.googleapis.com/auth/youtube"
@@ -164,20 +162,26 @@ GENRE_PRIORITY = [
 # ==========================================
 
 
-def request_device_code():
+def request_device_code(client_id):
     res = requests.post(DEVICE_CODE_URL, data={
-                        'client_id': CLIENT_ID, 'scope': SCOPE})
-    return res.json()
+                        'client_id': client_id, 'scope': SCOPE})
+    try:
+        return res.json()
+    except Exception:
+        return {"error": "http_error", "error_description": f"HTTP {res.status_code}: {res.text}"}
 
 
-def poll_device_token(device_code):
+def poll_device_token(client_id, client_secret, device_code):
     res = requests.post(TOKEN_URL, data={
-        'client_id': CLIENT_ID,
-        'client_secret': CLIENT_SECRET,
+        'client_id': client_id,
+        'client_secret': client_secret,
         'device_code': device_code,
         'grant_type': 'urn:ietf:params:oauth:grant-type:device_code'
     })
-    return res.json()
+    try:
+        return res.json()
+    except Exception:
+        return {"error": "http_error", "error_description": f"HTTP {res.status_code}: {res.text}"}
 
 # ==========================================
 # LÓGICA DE CLASIFICACIÓN
@@ -241,69 +245,125 @@ if "device_info" not in st.session_state:
     st.session_state["device_info"] = None
 
 # ------------------------------------------
-# PASO 1: CONEXIÓN OFICIAL CON GOOGLE
+# PASO 1: CONEXIÓN CON GOOGLE / YOUTUBE MUSIC
 # ------------------------------------------
 if not st.session_state["yt_credentials"]:
     st.markdown("### 🔒 Conectar tu cuenta de YouTube Music")
-    st.caption(
-        "Inicio de sesión seguro mediante la autenticación oficial de Google para Smart TVs / Apps.")
 
-    if not st.session_state["device_info"]:
-        if st.button("🔗 Generar Código de Conexión"):
-            info = request_device_code()
-            if "user_code" in info:
-                st.session_state["device_info"] = info
+    auth_method = st.radio(
+        "Seleccioná el método de autenticación:",
+        ["OAuth Google (Código de Dispositivo)",
+         "Headers / Cookie del Navegador"],
+        horizontal=True
+    )
+
+    if auth_method == "OAuth Google (Código de Dispositivo)":
+        st.caption(
+            "Requiere un Client ID de Google Cloud Console tipo 'TVs and Limited Input devices'.")
+
+        col_c1, col_c2 = st.columns(2)
+        with col_c1:
+            client_id_input = st.text_input("Client ID", value=os.getenv(
+                "YT_CLIENT_ID", ""), type="password", help="Obtenido en Google Cloud Console")
+        with col_c2:
+            client_secret_input = st.text_input("Client Secret", value=os.getenv(
+                "YT_CLIENT_SECRET", ""), type="password", help="Obtenido en Google Cloud Console")
+
+        if not st.session_state["device_info"]:
+            if st.button("🔗 Generar Código de Conexión"):
+                if not client_id_input:
+                    st.error(
+                        "Por favor ingresá tu Client ID de Google Cloud Console.")
+                else:
+                    info = request_device_code(client_id_input)
+                    if "user_code" in info:
+                        st.session_state["device_info"] = info
+                        st.session_state["active_client_id"] = client_id_input
+                        st.session_state["active_client_secret"] = client_secret_input
+                        st.rerun()
+                    else:
+                        err_msg = info.get(
+                            "error_description", info.get("error", "Desconocido"))
+                        st.error(f"Error de Google: {err_msg}")
+                        st.info(
+                            "💡 Asegurate de que el Client ID sea de tipo 'TVs and Limited Input devices' y que la API 'YouTube Data API v3' esté habilitada en Google Cloud Console.")
+        else:
+            info = st.session_state["device_info"]
+
+            st.markdown(f"""
+            <div class="yt-card">
+                <h4>Pasos para vincular tu cuenta:</h4>
+                <ol>
+                    <li>Hacé clic en el enlace oficial de Google: <a href="https://www.google.com/device" target="_blank" style="color: #FF0000; font-weight: bold;">google.com/device</a></li>
+                    <li>Escribí o pegá este código de verificación:</li>
+                </ol>
+                <div class="code-display">{info["user_code"]}</div>
+                <p style="color: #AAAAAA; font-size: 0.9rem;">Una vez ingresado el código en la pantalla de Google, hacé clic en el botón de abajo para verificar.</p>
+            </div>
+            """, unsafe_allow_html=True)
+
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                if st.button("✅ Ya ingresé el código"):
+                    cid = st.session_state.get(
+                        "active_client_id", client_id_input)
+                    csec = st.session_state.get(
+                        "active_client_secret", client_secret_input)
+                    token_data = poll_device_token(
+                        cid, csec, info["device_code"])
+                    if "access_token" in token_data:
+                        creds = {
+                            "access_token": token_data["access_token"],
+                            "refresh_token": token_data.get("refresh_token", ""),
+                            "scope": SCOPE,
+                            "token_type": "Bearer",
+                            "expires_in": token_data.get("expires_in", 3599)
+                        }
+                        st.session_state["yt_credentials"] = json.dumps(creds)
+                        st.session_state["device_info"] = None
+                        st.success("¡Cuenta conectada exitosamente!")
+                        st.rerun()
+                    elif token_data.get("error") == "authorization_pending":
+                        st.warning(
+                            "Google indica que aún no ingresaste el código. Por favor, aprobalo en google.com/device y reintentá.")
+                    else:
+                        st.error(
+                            f"Error de autorización: {token_data.get('error_description', token_data.get('error', 'Tiempo de espera agotado.'))}")
+
+            with col2:
+                if st.button("Cancelar"):
+                    st.session_state["device_info"] = None
+                    st.rerun()
+
+    else:
+        # Método por Headers / Cookie del navegador
+        st.caption(
+            "Copiá y pegá las cabeceras/cookie de tu sesión activa de YouTube Music.")
+        headers_raw = st.text_area(
+            "Cabeceras de red (o Cookie) de music.youtube.com:",
+            height=150,
+            placeholder="accept: */*\naccept-language: es-419,es;q=0.9\ncookie: VISITOR_INFO1_LIVE=...; __Secure-1PSID=...\n..."
+        )
+        if st.button("🔑 Conectar con Cabeceras"):
+            if headers_raw.strip():
+                st.session_state["yt_credentials"] = headers_raw.strip()
+                st.success("¡Cabeceras guardadas exitosamente!")
                 st.rerun()
             else:
-                st.error("Error al obtener el código de autorización de Google.")
-    else:
-        info = st.session_state["device_info"]
-
-        st.markdown("""
-        <div class="yt-card">
-            <h4>Pasos para vincular tu cuenta:</h4>
-            <ol>
-                <li>Hacé clic en el enlace oficial de Google: <a href="https://www.google.com/device" target="_blank" style="color: #FF0000; font-weight: bold;">google.com/device</a></li>
-                <li>Escribí o pegá este código de verificación:</li>
-            </ol>
-            <div class="code-display">{}</div>
-            <p style="color: #AAAAAA; font-size: 0.9rem;">Una vez ingresado el código en la pantalla de Google, hacé clic en el botón de abajo para verificar.</p>
-        </div>
-        """.format(info["user_code"]), unsafe_allow_html=True)
-
-        col1, col2 = st.columns([1, 1])
-        with col1:
-            if st.button("✅ Ya ingresé el código"):
-                token_data = poll_device_token(info["device_code"])
-                if "access_token" in token_data:
-                    creds = {
-                        "access_token": token_data["access_token"],
-                        "refresh_token": token_data.get("refresh_token", ""),
-                        "scope": SCOPE,
-                        "token_type": "Bearer",
-                        "expires_in": token_data.get("expires_in", 3599)
-                    }
-                    st.session_state["yt_credentials"] = json.dumps(creds)
-                    st.session_state["device_info"] = None
-                    st.success("¡Cuenta conectada exitosamente!")
-                    st.rerun()
-                elif token_data.get("error") == "authorization_pending":
-                    st.warning(
-                        "Google indica que aún no ingresaste el código. Por favor, aprobalo en google.com/device y reintentá.")
-                else:
-                    st.error(
-                        f"Error de autorización: {token_data.get('error_description', 'Tiempo de espera agotado.')}")
-
-        with col2:
-            if st.button("Cancel / Cancelar"):
-                st.session_state["device_info"] = None
-                st.rerun()
+                st.error("Por favor pegá tus cabeceras de red o cookie.")
 
 # ------------------------------------------
 # PASO 2: ORGANIZAR BIBLIOTECA
 # ------------------------------------------
 else:
-    yt = YTMusic(st.session_state["yt_credentials"])
+    try:
+        yt = YTMusic(st.session_state["yt_credentials"])
+    except Exception as e:
+        st.error(f"Error al inicializar sesión de YTMusic: {e}")
+        if st.button("Reintentar Inicio de Sesión"):
+            st.session_state["yt_credentials"] = None
+            st.rerun()
+        st.stop()
 
     st.markdown("""
     <div class="yt-card">
