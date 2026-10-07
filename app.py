@@ -381,10 +381,26 @@ else:
         status_text = st.empty()
 
         status_text.text("Obteniendo canciones de YouTube Music...")
-        liked_data = yt.get_liked_songs(limit=None)
+
+        errors = []
+        try:
+            liked_data = yt.get_liked_songs(limit=None)
+        except Exception as e:
+            liked_data = {}
+            errors.append(f"Me gusta: {type(e).__name__}: {e}")
         liked_tracks = liked_data.get(
             'tracks', []) if isinstance(liked_data, dict) else []
-        library_tracks = yt.get_library_songs(limit=None) or []
+
+        try:
+            library_tracks = yt.get_library_songs(limit=None) or []
+        except Exception as e:
+            library_tracks = []
+            errors.append(f"Biblioteca: {type(e).__name__}: {e}")
+
+        for msg in errors:
+            st.error(msg)
+        if not (liked_tracks or library_tracks):
+            st.stop()
 
         seen_ids = set()
         tracks = []
