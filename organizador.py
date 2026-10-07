@@ -3,14 +3,14 @@ import os
 import re
 import time
 import requests
-from ytmusicapi import YTMusic
+from ytmusicapi import OAuthCredentials, YTMusic, setup_oauth
 
 # ==========================================
 # CONFIGURACIÓN
 # ==========================================
 LASTFM_API_KEY = os.getenv(
-    'LASTFM_API_KEY', 'be13c0c8fe2692ce5eb11636925dd592')
-LASTFM_API_URL = 'http://ws.audioscrobbler.com/2.0/'
+    'LASTFM_API_KEY', '')
+LASTFM_API_URL = 'https://ws.audioscrobbler.com/2.0/'
 AUTH_FILES = ['browser.json', 'headers_auth.json', 'oauth.json']
 CACHE_FILE = 'genre_cache.json'
 
@@ -204,6 +204,8 @@ class LastFMClient:
         self.last_call = time.time()
 
     def get(self, params, max_retries=3):
+        if not self.api_key:
+            return {}
         params = {**params, 'api_key': self.api_key, 'format': 'json'}
         for attempt in range(max_retries):
             self._throttle()
@@ -313,10 +315,21 @@ def classify(lastfm, artist, track, album, cache):
 
 
 def authenticate():
+    client_id = os.getenv('YT_CLIENT_ID', '')
+    client_secret = os.getenv('YT_CLIENT_SECRET', '')
+
     # 1. Buscar archivos de autenticación existentes
     for auth_file in AUTH_FILES:
         if os.path.exists(auth_file):
             try:
+                if auth_file == 'oauth.json':
+                    if not client_id or not client_secret:
+                        continue
+                    return YTMusic(
+                        auth_file,
+                        oauth_credentials=OAuthCredentials(
+                            client_id, client_secret),
+                    )
                 return YTMusic(auth_file)
             except Exception:
                 pass
@@ -326,11 +339,17 @@ def authenticate():
     print("  PRIMERA CONFIGURACIÓN DE YOUTUBE MUSIC")
     print("=" * 50)
     print("No se encontró una sesión activa.")
+    if not client_id or not client_secret:
+        print("Definí YT_CLIENT_ID y YT_CLIENT_SECRET para usar OAuth.")
+        return None
     print("Se generará un código para vincular la cuenta de YouTube Music.\n")
     try:
-        YTMusic.setup_oauth(filepath="oauth.json")
+        setup_oauth(client_id, client_secret, filepath="oauth.json")
         print("\n¡Cuenta vinculada con éxito!\n")
-        return YTMusic("oauth.json")
+        return YTMusic(
+            "oauth.json",
+            oauth_credentials=OAuthCredentials(client_id, client_secret),
+        )
     except Exception as e:
         print(f"\nError al autenticar: {e}")
         return None

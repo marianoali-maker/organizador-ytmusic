@@ -4,7 +4,7 @@ import re
 import time
 import requests
 import streamlit as st
-from ytmusicapi import YTMusic
+from ytmusicapi import OAuthCredentials, YTMusic
 
 # ==========================================
 # CONFIGURACIÓN DE PÁGINA Y ESTILOS YOUTUBE MUSIC
@@ -87,9 +87,20 @@ DEVICE_CODE_URL = "https://oauth2.googleapis.com/device/code"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 SCOPE = "https://www.googleapis.com/auth/youtube"
 
-LASTFM_API_KEY = os.getenv(
-    'LASTFM_API_KEY', 'be13c0c8fe2692ce5eb11636925dd592')
-LASTFM_API_URL = 'http://ws.audioscrobbler.com/2.0/'
+
+def get_server_secret(name):
+    try:
+        value = st.secrets.get(name)
+    except Exception:
+        value = None
+    return value or os.getenv(name, "")
+
+
+YT_CLIENT_ID = get_server_secret("YT_CLIENT_ID")
+YT_CLIENT_SECRET = get_server_secret("YT_CLIENT_SECRET")
+
+LASTFM_API_KEY = get_server_secret("LASTFM_API_KEY")
+LASTFM_API_URL = 'https://ws.audioscrobbler.com/2.0/'
 
 LASTFM_SLEEP = 0.25
 YT_BATCH_SIZE = 50
@@ -162,26 +173,34 @@ GENRE_PRIORITY = [
 # ==========================================
 
 
-def request_device_code(client_id):
-    res = requests.post(DEVICE_CODE_URL, data={
-                        'client_id': client_id, 'scope': SCOPE})
+def request_oauth_response(url, data):
     try:
-        return res.json()
-    except Exception:
-        return {"error": "http_error", "error_description": f"HTTP {res.status_code}: {res.text}"}
+        response = requests.post(url, data=data, timeout=15)
+    except requests.RequestException as exc:
+        return {"error": "network_error", "error_description": str(exc)}
+    try:
+        return response.json()
+    except ValueError:
+        return {
+            "error": "http_error",
+            "error_description": f"HTTP {response.status_code}: respuesta inválida de Google.",
+        }
+
+
+def request_device_code(client_id):
+    return request_oauth_response(DEVICE_CODE_URL, {
+        'client_id': client_id,
+        'scope': SCOPE,
+    })
 
 
 def poll_device_token(client_id, client_secret, device_code):
-    res = requests.post(TOKEN_URL, data={
+    return request_oauth_response(TOKEN_URL, {
         'client_id': client_id,
         'client_secret': client_secret,
         'device_code': device_code,
         'grant_type': 'urn:ietf:params:oauth:grant-type:device_code'
     })
-    try:
-        return res.json()
-    except Exception:
-        return {"error": "http_error", "error_description": f"HTTP {res.status_code}: {res.text}"}
 
 # ==========================================
 # LÓGICA DE CLASIFICACIÓN
@@ -189,9 +208,14 @@ def poll_device_token(client_id, client_secret, device_code):
 
 
 def clean_title(title):
-    t = re.sub(r'\s*[\(\[][^\)\]]*(official\vert{}lyric\vert{}audio\vert{}video\vert{}hd\vert{}hq\vert{}remaster\vert{}remix\vert{}live)[\)\]]', '', title, flags=re.I)
     t = re.sub(
-        r'\s*[\(\[]?\s*(feat\.?\vert{}ft\.?\vert{}featuring\vert{}con)\s+[^\)\]]+[\)\]]?', '', t, flags=re.I)
+        r'\s*[\(\[][^\)\]]*(official|lyric|audio|video|hd|hq|remaster|remix|live)[^\)\]]*[\)\]]',
+        '', title, flags=re.I
+    )
+    t = re.sub(
+        r'\s*[\(\[]?\s*(feat\.?|ft\.?|featuring|con)\s+[^\)\]]+[\)\]]?',
+        '', t, flags=re.I
+    )
     return t.strip(' -–—')
 
 
@@ -208,6 +232,8 @@ def classify_local(artist, title, album):
 
 
 def lookup_lastfm(artist, track):
+    if not LASTFM_API_KEY:
+        return 'Sin clasificar'
     try:
         params = {'method': 'track.getInfo', 'artist': artist, 'track': track,
                   'api_key': LASTFM_API_KEY, 'format': 'json', 'autocorrect': 0}
@@ -243,50 +269,30 @@ if "yt_credentials" not in st.session_state:
     st.session_state["yt_credentials"] = None
 if "device_info" not in st.session_state:
     st.session_state["device_info"] = None
+if "yt_client" not in st.session_state:
+    st.session_state["yt_client"] = None
 
 # ------------------------------------------
 # PASO 1: CONEXIÓN CON GOOGLE / YOUTUBE MUSIC
 # ------------------------------------------
 if not st.session_state["yt_credentials"]:
     st.markdown("### 🔒 Conectar tu cuenta de YouTube Music")
+    st.caption(
+        "Vas a iniciar sesión en Google para autorizar el acceso. No ingreses tu contraseña en esta app.")
 
-    auth_method = st.radio(
-        "Seleccioná el método de autenticación:",
-        ["OAuth Google (Código de Dispositivo)",
-         "Headers / Cookie del Navegador"],
-        horizontal=True
-    )
-
-    if auth_method == "OAuth Google (Código de Dispositivo)":
-        st.caption(
-            "Requiere un Client ID de Google Cloud Console tipo 'TVs and Limited Input devices'.")
-
-        col_c1, col_c2 = st.columns(2)
-        with col_c1:
-            client_id_input = st.text_input("Client ID", value=os.getenv(
-                "YT_CLIENT_ID", ""), type="password", help="Obtenido en Google Cloud Console")
-        with col_c2:
-            client_secret_input = st.text_input("Client Secret", value=os.getenv(
-                "YT_CLIENT_SECRET", ""), type="password", help="Obtenido en Google Cloud Console")
-
+    if not YT_CLIENT_ID or not YT_CLIENT_SECRET:
+        st.error("La app todavía no está configurada con sus credenciales OAuth.")
+    else:
         if not st.session_state["device_info"]:
-            if st.button("🔗 Generar Código de Conexión"):
-                if not client_id_input:
-                    st.error(
-                        "Por favor ingresá tu Client ID de Google Cloud Console.")
+            if st.button("🔗 Conectar con Google"):
+                info = request_device_code(YT_CLIENT_ID)
+                if "user_code" in info:
+                    st.session_state["device_info"] = info
+                    st.rerun()
                 else:
-                    info = request_device_code(client_id_input)
-                    if "user_code" in info:
-                        st.session_state["device_info"] = info
-                        st.session_state["active_client_id"] = client_id_input
-                        st.session_state["active_client_secret"] = client_secret_input
-                        st.rerun()
-                    else:
-                        err_msg = info.get(
-                            "error_description", info.get("error", "Desconocido"))
-                        st.error(f"Error de Google: {err_msg}")
-                        st.info(
-                            "💡 Asegurate de que el Client ID sea de tipo 'TVs and Limited Input devices' y que la API 'YouTube Data API v3' esté habilitada en Google Cloud Console.")
+                    err_msg = info.get(
+                        "error_description", info.get("error", "Desconocido"))
+                    st.error(f"Error de Google: {err_msg}")
         else:
             info = st.session_state["device_info"]
 
@@ -305,24 +311,25 @@ if not st.session_state["yt_credentials"]:
             col1, col2 = st.columns([1, 1])
             with col1:
                 if st.button("✅ Ya ingresé el código"):
-                    cid = st.session_state.get(
-                        "active_client_id", client_id_input)
-                    csec = st.session_state.get(
-                        "active_client_secret", client_secret_input)
                     token_data = poll_device_token(
-                        cid, csec, info["device_code"])
-                    if "access_token" in token_data:
+                        YT_CLIENT_ID, YT_CLIENT_SECRET, info["device_code"])
+                    if token_data.get("access_token") and token_data.get("refresh_token"):
                         creds = {
                             "access_token": token_data["access_token"],
                             "refresh_token": token_data.get("refresh_token", ""),
                             "scope": SCOPE,
                             "token_type": "Bearer",
-                            "expires_in": token_data.get("expires_in", 3599)
+                            "expires_in": int(token_data.get("expires_in") or 3599),
+                            "expires_at": int(time.time()) + int(token_data.get("expires_in") or 3599),
                         }
                         st.session_state["yt_credentials"] = json.dumps(creds)
+                        st.session_state["yt_client"] = None
                         st.session_state["device_info"] = None
                         st.success("¡Cuenta conectada exitosamente!")
                         st.rerun()
+                    elif token_data.get("access_token"):
+                        st.error(
+                            "Google no devolvió un refresh token. Revocá el acceso de esta app en tu cuenta de Google y volvé a autorizar.")
                     elif token_data.get("error") == "authorization_pending":
                         st.warning(
                             "Google indica que aún no ingresaste el código. Por favor, aprobalo en google.com/device y reintentá.")
@@ -335,45 +342,37 @@ if not st.session_state["yt_credentials"]:
                     st.session_state["device_info"] = None
                     st.rerun()
 
-    else:
-        # Método por Headers / Cookie del navegador
-        st.caption(
-            "Copiá y pegá las cabeceras/cookie de tu sesión activa de YouTube Music.")
-        headers_raw = st.text_area(
-            "Cabeceras de red (o Cookie) de music.youtube.com:",
-            height=150,
-            placeholder="accept: */*\naccept-language: es-419,es;q=0.9\ncookie: VISITOR_INFO1_LIVE=...; __Secure-1PSID=...\n..."
-        )
-        if st.button("🔑 Conectar con Cabeceras"):
-            if headers_raw.strip():
-                st.session_state["yt_credentials"] = headers_raw.strip()
-                st.success("¡Cabeceras guardadas exitosamente!")
-                st.rerun()
-            else:
-                st.error("Por favor pegá tus cabeceras de red o cookie.")
-
 # ------------------------------------------
 # PASO 2: ORGANIZAR BIBLIOTECA
 # ------------------------------------------
 else:
     try:
-        yt = YTMusic(st.session_state["yt_credentials"])
+        yt = st.session_state["yt_client"]
+        if yt is None:
+            yt = YTMusic(
+                json.loads(st.session_state["yt_credentials"]),
+                oauth_credentials=OAuthCredentials(
+                    YT_CLIENT_ID, YT_CLIENT_SECRET),
+            )
+            st.session_state["yt_client"] = yt
     except Exception as e:
         st.error(f"Error al inicializar sesión de YTMusic: {e}")
         if st.button("Reintentar Inicio de Sesión"):
             st.session_state["yt_credentials"] = None
+            st.session_state["yt_client"] = None
             st.rerun()
         st.stop()
 
     st.markdown("""
     <div class="yt-card">
         <h4 style="margin:0; color: #4CAF50;">✓ Sesión activa y lista</h4>
-        <p style="margin:0; color: #AAAAAA; font-size: 0.9rem;">Tus datos de acceso están resguardados localmente en tu navegador durante esta sesión.</p>
+        <p style="margin:0; color: #AAAAAA; font-size: 0.9rem;">La autorización se mantiene durante esta sesión.</p>
     </div>
     """, unsafe_allow_html=True)
 
     if st.button("Cerrar Sesión"):
         st.session_state["yt_credentials"] = None
+        st.session_state["yt_client"] = None
         st.rerun()
 
     st.markdown("### 🚀 Iniciar Organización")
@@ -452,7 +451,8 @@ else:
                     yt.add_playlist_items(pl_id, new_ids[j:j + YT_BATCH_SIZE])
                     time.sleep(YT_BATCH_SLEEP)
 
-            results.append({"Género": genre, "Canciones agregadas": len(ids)})
+            results.append(
+                {"Género": genre, "Canciones agregadas": len(new_ids)})
 
         st.success("🎉 ¡Organización completada con éxito!")
         st.table(results)

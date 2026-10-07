@@ -3,6 +3,9 @@ browser.json
 headers_auth.json
 headers.txt
 genre_cache.json
+.env
+.venv/
+.streamlit/secrets.toml
 __pycache__/
 dist/
 build/
