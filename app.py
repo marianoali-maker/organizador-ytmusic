@@ -233,7 +233,8 @@ def get_access_token(force_refresh=False):
             "grant_type": "refresh_token",
         })
         if not data.get("access_token"):
-            detail = data.get("error_description", data.get("error", "error desconocido"))
+            detail = data.get("error_description", data.get(
+                "error", "error desconocido"))
             raise YouTubeAPIError(
                 401, "auth", f"No se pudo renovar la sesión de Google: {detail}")
         expires_in = int(data.get("expires_in") or 3599)
@@ -378,25 +379,63 @@ def classify_local(artist, title, album):
     return None
 
 
-def lookup_lastfm(artist, track):
-    if not LASTFM_API_KEY:
-        return 'Sin clasificar'
+def genre_from_text(text):
+    text = text.lower()
+    for keyword, canonical in GENRE_PRIORITY:
+        if re.search(r'\b' + re.escape(keyword) + r'\b', text):
+            return canonical
+    return None
+
+
+def new_lastfm_stats():
+    return {"requests": 0, "errors": 0, "last_error": "",
+            "classified": 0, "artist_tags": {}}
+
+
+def lastfm_get_tags(params, stats):
+    """Consulta Last.fm y devuelve la lista de etiquetas (vacía si no hay o falla)."""
+    stats["requests"] += 1
     try:
-        params = {'method': 'track.getInfo', 'artist': artist, 'track': track,
-                  'api_key': LASTFM_API_KEY, 'format': 'json', 'autocorrect': 0}
-        r = requests.get(LASTFM_API_URL, params=params, timeout=5)
-        if r.status_code == 200:
-            data = r.json()
-            tags = data.get('track', {}).get('toptags', {}).get('tag', [])
-            if isinstance(tags, dict):
-                tags = [tags]
-            tag_names = " ".join([(t.get('name') or '').lower() for t in tags])
-            for keyword, canonical in GENRE_PRIORITY:
-                if re.search(r'\b' + re.escape(keyword) + r'\b', tag_names):
-                    return canonical
-    except Exception:
-        pass
-    return 'Sin clasificar'
+        data = requests.get(LASTFM_API_URL, params=params, timeout=8).json()
+    except Exception as exc:
+        stats["errors"] += 1
+        stats["last_error"] = f"{type(exc).__name__}: {exc}"[:150]
+        return []
+    if "error" in data:
+        if data.get("error") != 6:  # 6 = no encontrado (normal en temas poco conocidos)
+            stats["errors"] += 1
+            stats["last_error"] = f"Last.fm {data.get('error')}: {data.get('message', '')}"[
+                :150]
+        return []
+    container = data.get("track") or data
+    tags = container.get("toptags", {}).get("tag", [])
+    if isinstance(tags, dict):
+        tags = [tags]
+    return [(t.get("name") or "").lower() for t in tags]
+
+
+def lookup_lastfm(artist, track, stats):
+    """Devuelve (género, etiquetas vistas). Prueba primero la canción y luego el artista."""
+    if not LASTFM_API_KEY:
+        return 'Sin clasificar', []
+    base = {'api_key': LASTFM_API_KEY, 'format': 'json', 'autocorrect': 1}
+    track_tags = lastfm_get_tags(
+        {**base, 'method': 'track.getInfo', 'artist': artist, 'track': track}, stats)
+    time.sleep(LASTFM_SLEEP)
+    seen = list(track_tags)
+    genre = genre_from_text(" ".join(track_tags))
+    if not genre:
+        key = artist.lower()
+        if key not in stats["artist_tags"]:
+            stats["artist_tags"][key] = lastfm_get_tags(
+                {**base, 'method': 'artist.getTopTags', 'artist': artist}, stats)
+            time.sleep(LASTFM_SLEEP)
+        artist_tags = stats["artist_tags"][key]
+        seen += artist_tags
+        genre = genre_from_text(" ".join(artist_tags))
+    if genre:
+        stats["classified"] += 1
+    return genre or 'Sin clasificar', seen[:6]
 
 
 # ==========================================
@@ -411,7 +450,8 @@ def organizar(max_adds, progress_bar, status_text, results):
     así que si se agota la cuota a mitad de camino el avance queda registrado.
     """
     summary = {"limit_reached": False, "failed": 0, "last_error": "",
-               "unclassified": 0, "tracks": 0}
+               "unclassified": 0, "tracks": 0,
+               "unclassified_list": [], "lastfm": new_lastfm_stats()}
 
     status_text.text("Obteniendo tus videos con 'Me gusta'...")
     tracks, total_liked = fetch_liked_music()
@@ -423,19 +463,27 @@ def organizar(max_adds, progress_bar, status_text, results):
         return summary
 
     genre_map = {}
+    lastfm_stats = new_lastfm_stats()
+    unclassified_list = []
     for i, track in enumerate(tracks, 1):
         clean_t = clean_title(track["title"])
         genre = classify_local(track["artist"], clean_t, "")
         if not genre:
-            genre = lookup_lastfm(track["artist"], clean_t)
-            if LASTFM_API_KEY:
-                time.sleep(LASTFM_SLEEP)
+            genre, seen_tags = lookup_lastfm(
+                track["artist"], clean_t, lastfm_stats)
+            if genre == 'Sin clasificar':
+                unclassified_list.append({
+                    "Artista": track["artist"],
+                    "Canción": track["title"],
+                    "Etiquetas de Last.fm": ", ".join(seen_tags) or "(ninguna)"})
         genre_map.setdefault(genre, []).append(track["videoId"])
         progress_bar.progress(int(i / len(tracks) * 100))
         status_text.text(
             f"Analizando: {i}/{len(tracks)} - {track['title']} → ({genre})")
 
     summary["unclassified"] = len(genre_map.get('Sin clasificar', []))
+    summary["unclassified_list"] = unclassified_list
+    summary["lastfm"] = lastfm_stats
 
     status_text.text("Revisando tus playlists...")
     existing = fetch_my_playlists()
@@ -450,7 +498,8 @@ def organizar(max_adds, progress_bar, status_text, results):
             break
 
         playlist_id = existing.get(genre)
-        current_ids = fetch_playlist_video_ids(playlist_id) if playlist_id else set()
+        current_ids = fetch_playlist_video_ids(
+            playlist_id) if playlist_id else set()
         new_ids = [v for v in ids if v not in current_ids]
         results.setdefault(genre, 0)
         if not new_ids:
@@ -596,6 +645,12 @@ else:
         "Cada canción agregada consume cuota de la API de YouTube (unas 50 unidades; el tope diario "
         "por defecto es de 10.000 y se comparte entre todos los usuarios de la app). "
         "Si no alcanza en un día, volvé a ejecutar al siguiente: la app salta lo que ya está en cada playlist.")
+    if LASTFM_API_KEY:
+        st.caption("Last.fm: clave detectada ✓")
+    else:
+        st.warning(
+            "No se detectó LASTFM_API_KEY en los Secrets: solo se clasificará por la lista de "
+            "artistas y las palabras del título.")
     max_adds = st.number_input(
         "Máximo de canciones a agregar en esta ejecución",
         min_value=10, max_value=1000, value=DEFAULT_MAX_ADDS, step=10)
@@ -614,7 +669,8 @@ else:
                 "Volvé a ejecutar mañana (la cuota se reinicia a medianoche, hora del Pacífico) "
                 "y la app seguirá desde donde quedó.")
         except YouTubeAPIError as exc:
-            st.error(f"Error de YouTube ({exc.status} {exc.reason}): {exc.message}")
+            st.error(
+                f"Error de YouTube ({exc.status} {exc.reason}): {exc.message}")
 
         status_text.empty()
 
@@ -623,10 +679,18 @@ else:
                 st.info(
                     "No se encontraron canciones de música entre tus videos con 'Me gusta'.")
             else:
+                if LASTFM_API_KEY:
+                    lf = summary["lastfm"]
+                    detail = f" Último error: {lf['last_error']}" if lf["errors"] else ""
+                    st.caption(
+                        f"Last.fm: {lf['requests']} consultas, {lf['classified']} canciones "
+                        f"clasificadas con sus etiquetas, {lf['errors']} errores.{detail}")
                 if summary["unclassified"]:
                     st.caption(
                         f"{summary['unclassified']} canciones quedaron 'Sin clasificar' "
                         "y no se agregaron a ninguna playlist.")
+                    with st.expander("Ver las canciones sin clasificar y sus etiquetas"):
+                        st.dataframe(summary["unclassified_list"])
                 if summary["failed"]:
                     st.warning(
                         f"{summary['failed']} canciones no se pudieron agregar "
@@ -641,3 +705,5 @@ else:
         if results:
             st.table([{"Género": g, "Canciones agregadas": n}
                       for g, n in results.items()])
+            st.caption(
+                "Un 0 significa que esas canciones ya estaban en la playlist.")
