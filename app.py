@@ -152,6 +152,7 @@ GENRE_PRIORITY = [
     ('cumbia villera', 'Cumbia'),
     ('cumbia', 'Cumbia'),
     ('cuarteto', 'Cuarteto'),
+    ('tango', 'Tango'),
     ('bossa nova', 'Bossa Nova'),
     ('bossa', 'Bossa Nova'),
     ('pagode', 'Samba'),
@@ -169,6 +170,12 @@ GENRE_PRIORITY = [
     ('latino', 'Latin'),
     ('latin', 'Latin'),
 ]
+
+OMIT_LABEL = "— Omitir —"
+EXTRA_GENRES = ["Folklore", "Electrónica", "Hip Hop", "Jazz", "Reggae",
+                "Indie", "Salsa", "Baladas", "Clásica", "Otros"]
+GENRE_CHOICES = [OMIT_LABEL] + sorted(
+    {g for _, g in GENRE_PRIORITY} | set(ARTIST_MAP.values()) | set(EXTRA_GENRES))
 
 # ==========================================
 # FUNCIONES AUXILIARES DE OAUTH
@@ -443,55 +450,16 @@ def lookup_lastfm(artist, track, stats):
 # ==========================================
 
 
-def organizar(max_adds, progress_bar, status_text, results):
-    """Clasifica los 'Me gusta' y los agrega a playlists por género.
-
-    Va completando `results` (género -> canciones agregadas) a medida que avanza,
-    así que si se agota la cuota a mitad de camino el avance queda registrado.
-    """
-    summary = {"limit_reached": False, "failed": 0, "last_error": "",
-               "unclassified": 0, "tracks": 0,
-               "unclassified_list": [], "lastfm": new_lastfm_stats()}
-
-    status_text.text("Obteniendo tus videos con 'Me gusta'...")
-    tracks, total_liked = fetch_liked_music()
-    summary["tracks"] = len(tracks)
-    st.markdown(
-        f"**Canciones encontradas para procesar:** `{len(tracks)}` "
-        f"(de {total_liked} videos con 'Me gusta')")
-    if not tracks:
-        return summary
-
-    genre_map = {}
-    lastfm_stats = new_lastfm_stats()
-    unclassified_list = []
-    for i, track in enumerate(tracks, 1):
-        clean_t = clean_title(track["title"])
-        genre = classify_local(track["artist"], clean_t, "")
-        if not genre:
-            genre, seen_tags = lookup_lastfm(
-                track["artist"], clean_t, lastfm_stats)
-            if genre == 'Sin clasificar':
-                unclassified_list.append({
-                    "Artista": track["artist"],
-                    "Canción": track["title"],
-                    "Etiquetas de Last.fm": ", ".join(seen_tags) or "(ninguna)"})
-        genre_map.setdefault(genre, []).append(track["videoId"])
-        progress_bar.progress(int(i / len(tracks) * 100))
-        status_text.text(
-            f"Analizando: {i}/{len(tracks)} - {track['title']} → ({genre})")
-
-    summary["unclassified"] = len(genre_map.get('Sin clasificar', []))
-    summary["unclassified_list"] = unclassified_list
-    summary["lastfm"] = lastfm_stats
-
+def sync_playlists(genre_map, max_adds, status_text, results, summary,
+                   min_tracks=MIN_TRACKS_PER_GENRE):
+    """Agrega las canciones de cada género a su playlist (la crea si no existe)."""
     status_text.text("Revisando tus playlists...")
     existing = fetch_my_playlists()
     remaining = int(max_adds)
     consecutive_failures = 0
 
     for genre, ids in genre_map.items():
-        if genre == 'Sin clasificar' or len(ids) < MIN_TRACKS_PER_GENRE:
+        if genre == 'Sin clasificar' or len(ids) < min_tracks:
             continue
         if remaining <= 0:
             summary["limit_reached"] = True
@@ -532,6 +500,52 @@ def organizar(max_adds, progress_bar, status_text, results):
             remaining -= 1
             time.sleep(YT_INSERT_SLEEP)
 
+
+def organizar(max_adds, progress_bar, status_text, results):
+    """Clasifica los 'Me gusta' y los agrega a playlists por género.
+
+    Va completando `results` (género -> canciones agregadas) a medida que avanza,
+    así que si se agota la cuota a mitad de camino el avance queda registrado.
+    """
+    summary = {"limit_reached": False, "failed": 0, "last_error": "",
+               "unclassified": 0, "tracks": 0,
+               "unclassified_list": [], "lastfm": new_lastfm_stats()}
+
+    status_text.text("Obteniendo tus videos con 'Me gusta'...")
+    tracks, total_liked = fetch_liked_music()
+    summary["tracks"] = len(tracks)
+    st.markdown(
+        f"**Canciones encontradas para procesar:** `{len(tracks)}` "
+        f"(de {total_liked} videos con 'Me gusta')")
+    if not tracks:
+        return summary
+
+    genre_map = {}
+    lastfm_stats = new_lastfm_stats()
+    unclassified_list = []
+    for i, track in enumerate(tracks, 1):
+        clean_t = clean_title(track["title"])
+        genre = classify_local(track["artist"], clean_t, "")
+        if not genre:
+            genre, seen_tags = lookup_lastfm(
+                track["artist"], clean_t, lastfm_stats)
+            if genre == 'Sin clasificar':
+                unclassified_list.append({
+                    "videoId": track["videoId"],
+                    "artist": track["artist"],
+                    "title": track["title"],
+                    "tags": ", ".join(seen_tags)})
+        genre_map.setdefault(genre, []).append(track["videoId"])
+        progress_bar.progress(int(i / len(tracks) * 100))
+        status_text.text(
+            f"Analizando: {i}/{len(tracks)} - {track['title']} → ({genre})")
+
+    summary["unclassified"] = len(genre_map.get('Sin clasificar', []))
+    summary["unclassified_list"] = unclassified_list
+    st.session_state["pending_unclassified"] = unclassified_list
+    summary["lastfm"] = lastfm_stats
+
+    sync_playlists(genre_map, max_adds, status_text, results, summary)
     return summary
 
 
@@ -688,9 +702,8 @@ else:
                 if summary["unclassified"]:
                     st.caption(
                         f"{summary['unclassified']} canciones quedaron 'Sin clasificar' "
-                        "y no se agregaron a ninguna playlist.")
-                    with st.expander("Ver las canciones sin clasificar y sus etiquetas"):
-                        st.dataframe(summary["unclassified_list"])
+                        "y todavía no se agregaron a ninguna playlist. "
+                        "Más abajo podés elegir su género a mano.")
                 if summary["failed"]:
                     st.warning(
                         f"{summary['failed']} canciones no se pudieron agregar "
@@ -707,3 +720,93 @@ else:
                       for g, n in results.items()])
             st.caption(
                 "Un 0 significa que esas canciones ya estaban en la playlist.")
+
+    # ------------------------------------------
+    # ASIGNACIÓN MANUAL DE LO QUE QUEDÓ SIN CLASIFICAR
+    # ------------------------------------------
+    report = st.session_state.pop("manual_report", None)
+    if report:
+        for level, text in report["messages"]:
+            getattr(st, level)(text)
+        if report["results"]:
+            st.table(report["results"])
+        if report["snippet"]:
+            st.caption(
+                "Para que la próxima vez se clasifiquen solas, pegá estas líneas "
+                "dentro de ARTIST_MAP en app.py:")
+            st.code(report["snippet"], language="python")
+
+    pending = st.session_state.get("pending_unclassified") or []
+    if pending:
+        by_artist = {}
+        for item in pending:
+            by_artist.setdefault(item["artist"], []).append(item)
+
+        st.markdown("### 🧩 Elegí el género de lo que quedó sin clasificar")
+        st.caption(
+            "Asigná un género a cada artista (o dejá 'Omitir'). Sus canciones se agregan a la "
+            "playlist de ese género, que se crea si no existe. Cuenta para el máximo de arriba.")
+        with st.form("manual_genres"):
+            for artist, items in by_artist.items():
+                tags = items[0]["tags"] or "sin etiquetas"
+                st.selectbox(
+                    f"{artist} · {len(items)} canción(es) · Last.fm: {tags}",
+                    GENRE_CHOICES, key=f"manual_genre::{artist}")
+            submitted = st.form_submit_button("Agregar a mis playlists")
+
+        if submitted:
+            genre_map, assigned = {}, {}
+            for artist, items in by_artist.items():
+                genre = st.session_state.get(
+                    f"manual_genre::{artist}", OMIT_LABEL)
+                if genre != OMIT_LABEL:
+                    genre_map.setdefault(genre, []).extend(
+                        i["videoId"] for i in items)
+                    assigned[artist] = genre
+
+            if not assigned:
+                st.info("No elegiste ningún género todavía.")
+            else:
+                messages, manual_results = [], {}
+                manual_summary = {"limit_reached": False,
+                                  "failed": 0, "last_error": ""}
+                holder = st.empty()
+                done = False
+                try:
+                    sync_playlists(genre_map, max_adds, holder, manual_results,
+                                   manual_summary, min_tracks=1)
+                    done = not manual_summary["limit_reached"]
+                except QuotaExceeded:
+                    messages.append((
+                        "warning",
+                        "Se alcanzó la cuota diaria de la API de YouTube. Lo que ya se agregó quedó "
+                        "guardado; volvé a enviar mañana y la app salta lo que ya está."))
+                except YouTubeAPIError as exc:
+                    messages.append(
+                        ("error", f"Error de YouTube ({exc.status} {exc.reason}): {exc.message}"))
+                holder.empty()
+                if manual_summary["failed"]:
+                    messages.append((
+                        "warning",
+                        f"{manual_summary['failed']} canciones no se pudieron agregar. "
+                        f"Último error: {manual_summary['last_error']}"))
+                if manual_summary["limit_reached"]:
+                    messages.append((
+                        "info",
+                        "Llegaste al máximo de canciones de esta ejecución. "
+                        "Volvé a enviar para seguir con el resto."))
+                if done:
+                    messages.append(
+                        ("success", "¡Listo! Las canciones se agregaron a sus playlists."))
+                    assigned_ids = {i["videoId"]
+                                    for a in assigned for i in by_artist[a]}
+                    st.session_state["pending_unclassified"] = [
+                        i for i in pending if i["videoId"] not in assigned_ids]
+                st.session_state["manual_report"] = {
+                    "messages": messages,
+                    "results": [{"Género": g, "Canciones agregadas": n}
+                                for g, n in manual_results.items()],
+                    "snippet": "\n".join(
+                        f"    {a.lower()!r}: {g!r}," for a, g in assigned.items()),
+                }
+                st.rerun()
