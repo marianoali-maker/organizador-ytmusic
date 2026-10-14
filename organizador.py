@@ -4,6 +4,8 @@ import re
 import time
 import requests
 from ytmusicapi import OAuthCredentials, YTMusic, setup_oauth
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
 
 # ==========================================
 # CONFIGURACIÓN
@@ -19,6 +21,20 @@ YT_BATCH_SIZE = 50
 YT_BATCH_SLEEP = 1.0
 MIN_TRACKS_PER_GENRE = 3
 CREATE_UNCLASSIFIED_PLAYLIST = False
+
+# --- CONFIGURACIÓN DE SPOTIFY (Respaldo seguro mediante variables de entorno) ---
+sp_client_id = os.getenv("SPOTIPY_CLIENT_ID")
+sp_client_secret = os.getenv("SPOTIPY_CLIENT_SECRET")
+
+sp = None
+if sp_client_id and sp_client_secret:
+    try:
+        auth_manager = SpotifyClientCredentials(
+            client_id=sp_client_id, client_secret=sp_client_secret
+        )
+        sp = spotipy.Spotify(auth_manager=auth_manager)
+    except Exception as e:
+        print(f"Aviso: No se pudo inicializar Spotify: {e}")
 
 # Mapeo directo por Artistas (Máxima prioridad)
 ARTIST_MAP = {
@@ -110,6 +126,10 @@ GENRE_PRIORITY = [
     ('synthpop', 'Synthpop'),
     ('banda sonora', 'Bandas Sonoras'),
     ('soundtrack', 'Bandas Sonoras'),
+    # Subgéneros específicos añadidos para Spotify / Niche
+    ('k-pop', 'K-Pop'),
+    ('j-pop', 'J-Pop'),
+    ('k-rap', 'Hip-Hop'),
 
     # Géneros intermedios (Prioridad 2)
     ('techno', 'Techno'),
@@ -261,6 +281,25 @@ class LastFMClient:
         return self.extract_genre_from_tags(tags)
 
 
+def lookup_spotify_genre(artist):
+    """Consulta los géneros del artista en Spotify como sistema de respaldo."""
+    if not sp:
+        return None
+    try:
+        resultado = sp.search(q=f"artist:{artist}", type="artist", limit=1)
+        items = resultado.get("artists", {}).get("items", [])
+        if items and items[0].get("genres"):
+            artist_genres = " ".join(items[0]["genres"]).lower()
+            for keyword, canonical in GENRE_PRIORITY:
+                if re.search(r'\b' + re.escape(keyword) + r'\b', artist_genres):
+                    return canonical
+            # Si tiene géneros en Spotify pero ninguno hizo match directo con la prioridad, devuelve el primero capitalizado
+            return items[0]["genres"][0].title()
+    except Exception as e:
+        print(f"Error consultando Spotify para el artista {artist}: {e}")
+    return None
+
+
 def clean_title(title):
     t = re.sub(
         r'\s*[\(\[][^\)\]]*(official|lyric|audio|video|hd|hq|remaster|'
@@ -303,10 +342,15 @@ def classify(lastfm, artist, track, album, cache):
     if key in cache and cache[key] not in ['Metal', 'Latin', 'Sin clasificar']:
         return cache[key]
 
-    # 3. Consulta a Last.fm con filtrado estricto por prioridad de etiquetas
+    # 3. Consulta a Last.fm
     genre = lastfm.lookup_track(artist, track)
     if not genre:
         genre = lastfm.lookup_artist(artist)
+
+    # 4. Si Last.fm falla, consultar Spotify como respaldo automático
+    if not genre:
+        genre = lookup_spotify_genre(artist)
+
     if not genre:
         genre = 'Sin clasificar'
 
