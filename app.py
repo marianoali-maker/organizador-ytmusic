@@ -5,6 +5,7 @@ import time
 
 import requests
 import streamlit as st
+import musicbrainzngs
 
 # ==========================================
 # CONFIGURACIÓN DE PÁGINA Y ESTILOS YOUTUBE MUSIC
@@ -102,16 +103,12 @@ YT_CLIENT_SECRET = get_server_secret("YT_CLIENT_SECRET")
 
 LASTFM_API_KEY = get_server_secret("LASTFM_API_KEY")
 LASTFM_API_URL = 'https://ws.audioscrobbler.com/2.0/'
-SPOTIFY_CLIENT_ID = (
-    get_server_secret("SPOTIPY_CLIENT_ID")
-    or get_server_secret("SPOTIFY_CLIENT_ID")
-)
-SPOTIFY_CLIENT_SECRET = (
-    get_server_secret("SPOTIPY_CLIENT_SECRET")
-    or get_server_secret("SPOTIFY_CLIENT_SECRET")
-)
-SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
-SPOTIFY_API_URL = "https://api.spotify.com/v1"
+MUSICBRAINZ_CONTACT = get_server_secret(
+    "MUSICBRAINZ_CONTACT_EMAIL"
+) or "https://github.com/marianoali-maker/organizador-ytmusic"
+musicbrainzngs.set_useragent(
+    "OrganizadorYTMusic", "1.0", MUSICBRAINZ_CONTACT)
+musicbrainzngs.set_rate_limit(1.0)
 
 LASTFM_SLEEP = 0.25
 YT_INSERT_SLEEP = 0.3
@@ -468,85 +465,18 @@ def lookup_lastfm(artist, track, stats):
     return genre or 'Sin clasificar', seen[:6]
 
 
-def new_spotify_stats():
+def new_musicbrainz_stats():
     return {
         "searches": 0,
         "errors": 0,
         "last_error": "",
         "classified": 0,
-        "access_token": "",
-        "expires_at": 0,
         "artist_genres": {},
     }
 
 
-def format_spotify_error(exc):
-    """Devuelve el motivo de Spotify sin incluir la URL ni credenciales."""
-    response = exc.response
-    if response is None:
-        return f"{type(exc).__name__}: {exc}"[:150]
-
-    detail = ""
-    try:
-        payload = response.json()
-    except ValueError:
-        payload = None
-
-    if isinstance(payload, dict):
-        error = payload.get("error")
-        if isinstance(error, dict):
-            detail = str(error.get("message") or "")
-        elif error:
-            detail = str(error)
-    if not detail:
-        detail = (response.text or "").strip()
-
-    message = f"HTTP {response.status_code}"
-    if detail:
-        message = f"{message}: {detail}"
-    return f"Spotify {message}"[:150]
-
-
-def get_spotify_access_token(stats):
-    """Obtiene y reutiliza un token de aplicación para las búsquedas de Spotify."""
-    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
-        return None
-    if stats["access_token"] and stats["expires_at"] - 60 > time.time():
-        return stats["access_token"]
-
-    try:
-        response = requests.post(
-            SPOTIFY_TOKEN_URL,
-            data={"grant_type": "client_credentials"},
-            auth=(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET),
-            timeout=8,
-        )
-        response.raise_for_status()
-        data = response.json()
-    except requests.RequestException as exc:
-        stats["errors"] += 1
-        stats["last_error"] = format_spotify_error(exc)
-        return None
-    except ValueError:
-        stats["errors"] += 1
-        stats["last_error"] = (
-            f"Spotify devolvió una respuesta no JSON (HTTP {response.status_code})."
-        )
-        return None
-
-    token = data.get("access_token") if isinstance(data, dict) else None
-    if not token:
-        stats["errors"] += 1
-        stats["last_error"] = "Spotify no devolvió un token de acceso."
-        return None
-
-    stats["access_token"] = token
-    stats["expires_at"] = time.time() + int(data.get("expires_in") or 3600)
-    return token
-
-
-def lookup_spotify_genre(artist, stats):
-    """Busca el artista en Spotify y devuelve un género compatible, si existe."""
+def lookup_musicbrainz_genre(artist, stats):
+    """Busca etiquetas del artista en MusicBrainz y devuelve un género compatible."""
     if not artist:
         return None
     artist_key = artist.casefold()
@@ -556,36 +486,28 @@ def lookup_spotify_genre(artist, stats):
             stats["classified"] += 1
         return genre
 
-    token = get_spotify_access_token(stats)
-    if not token:
+    clean_artist = re.sub(r"[\(\[].*?[\)\]]", "", artist).strip()
+    if not clean_artist:
         return None
 
     stats["searches"] += 1
     try:
-        response = requests.get(
-            f"{SPOTIFY_API_URL}/search",
-            params={"q": f"artist:{artist}", "type": "artist", "limit": 5},
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=8,
-        )
-        response.raise_for_status()
-        data = response.json()
-    except requests.RequestException as exc:
-        stats["errors"] += 1
-        stats["last_error"] = format_spotify_error(exc)
-        return None
-    except ValueError:
+        result = musicbrainzngs.search_artists(artist=clean_artist, limit=5)
+    except (
+            musicbrainzngs.WebServiceError,
+            musicbrainzngs.NetworkError,
+            musicbrainzngs.UsageError) as exc:
         stats["errors"] += 1
         stats["last_error"] = (
-            f"Spotify devolvió una respuesta no JSON (HTTP {response.status_code})."
-        )
+            f"{type(exc).__name__}: {exc}"
+        ).replace("\n", " ")[:150]
+        stats["artist_genres"][artist_key] = None
         return None
 
-    artists = data.get("artists", {}) if isinstance(data, dict) else {}
-    items = artists.get("items", []) if isinstance(artists, dict) else []
+    items = result.get("artist-list", []) if isinstance(result, dict) else []
     genre = None
     if items:
-        normalized_artist = re.sub(r"\W+", "", artist.casefold())
+        normalized_artist = re.sub(r"\W+", "", clean_artist.casefold())
         matching_artist = next(
             (
                 item for item in items
@@ -594,8 +516,15 @@ def lookup_spotify_genre(artist, stats):
             ),
             items[0],
         )
-        genres = matching_artist.get("genres") or []
-        genre = genre_from_text(" ".join(genres)) if genres else None
+        tags = matching_artist.get("tag-list") or []
+        tag_names = [
+            tag.get("name", "").strip().lower()
+            for tag in tags
+            if isinstance(tag, dict) and tag.get("name")
+        ]
+        genre = genre_from_text(" ".join(tag_names))
+        if not genre and tag_names:
+            genre = tag_names[0].title()
 
     stats["artist_genres"][artist_key] = genre
     if genre:
@@ -668,7 +597,7 @@ def organizar(max_adds, progress_bar, status_text, results):
     summary = {"limit_reached": False, "failed": 0, "last_error": "",
                "unclassified": 0, "tracks": 0,
                "unclassified_list": [], "lastfm": new_lastfm_stats(),
-               "spotify": new_spotify_stats()}
+               "musicbrainz": new_musicbrainz_stats()}
 
     status_text.text("Obteniendo tus videos con 'Me gusta'...")
     tracks, total_liked = fetch_liked_music()
@@ -681,7 +610,7 @@ def organizar(max_adds, progress_bar, status_text, results):
 
     genre_map = {}
     lastfm_stats = new_lastfm_stats()
-    spotify_stats = new_spotify_stats()
+    musicbrainz_stats = new_musicbrainz_stats()
     unclassified_list = []
     for i, track in enumerate(tracks, 1):
         clean_t = clean_title(track["title"])
@@ -690,10 +619,10 @@ def organizar(max_adds, progress_bar, status_text, results):
             genre, seen_tags = lookup_lastfm(
                 track["artist"], clean_t, lastfm_stats)
             if genre == 'Sin clasificar':
-                spotify_genre = lookup_spotify_genre(
-                    track["artist"], spotify_stats)
-                if spotify_genre:
-                    genre = spotify_genre
+                musicbrainz_genre = lookup_musicbrainz_genre(
+                    track["artist"], musicbrainz_stats)
+                if musicbrainz_genre:
+                    genre = musicbrainz_genre
             if genre == 'Sin clasificar':
                 unclassified_list.append({
                     "videoId": track["videoId"],
@@ -709,7 +638,7 @@ def organizar(max_adds, progress_bar, status_text, results):
     summary["unclassified_list"] = unclassified_list
     st.session_state["pending_unclassified"] = unclassified_list
     summary["lastfm"] = lastfm_stats
-    summary["spotify"] = spotify_stats
+    summary["musicbrainz"] = musicbrainz_stats
 
     sync_playlists(genre_map, max_adds, status_text, results, summary)
     return summary
@@ -830,7 +759,7 @@ else:
     else:
         st.warning(
             "No se detectó LASTFM_API_KEY en los Secrets: se usará la lista local de artistas "
-            "y Spotify si configuraste sus credenciales.")
+            "y MusicBrainz como respaldo.")
     max_adds = st.number_input(
         "Máximo de canciones a agregar en esta ejecución",
         min_value=10, max_value=1000, value=DEFAULT_MAX_ADDS, step=10)
@@ -859,24 +788,21 @@ else:
                 st.info(
                     "No se encontraron canciones de música entre tus videos con 'Me gusta'.")
             else:
-                if LASTFM_API_KEY or (
-                        SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET):
+                if LASTFM_API_KEY:
                     lf = summary["lastfm"]
                     detail = f" Último error: {lf['last_error']}" if lf["errors"] else ""
-                    spotify = summary["spotify"]
-                    spotify_detail = (
-                        f" Último error de Spotify: {spotify['last_error']}"
-                        if spotify["errors"] else "")
-                    spotify_status = (
-                        f"Spotify: {spotify['searches']} búsquedas, "
-                        f"{spotify['classified']} canciones clasificadas, "
-                        f"{spotify['errors']} errores.{spotify_detail}"
-                        if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET
-                        else "Spotify: respaldo desactivado (faltan credenciales).")
-                    st.caption(
+                    lastfm_status = (
                         f"Last.fm: {lf['requests']} consultas, {lf['classified']} canciones "
-                        f"clasificadas con sus etiquetas, {lf['errors']} errores.{detail} "
-                        f"{spotify_status}")
+                        f"clasificadas con sus etiquetas, {lf['errors']} errores.{detail}")
+                else:
+                    lastfm_status = "Last.fm: sin configurar."
+                mb = summary["musicbrainz"]
+                mb_detail = (
+                    f" Último error: {mb['last_error']}" if mb["errors"] else "")
+                st.caption(
+                    f"{lastfm_status} MusicBrainz: {mb['searches']} búsquedas, "
+                    f"{mb['classified']} canciones clasificadas, "
+                    f"{mb['errors']} errores.{mb_detail}")
                 if summary["unclassified"]:
                     st.caption(
                         f"{summary['unclassified']} canciones quedaron 'Sin clasificar' "

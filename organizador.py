@@ -3,9 +3,8 @@ import os
 import re
 import time
 import requests
+import musicbrainzngs
 from ytmusicapi import OAuthCredentials, YTMusic, setup_oauth
-import spotipy
-from spotipy.oauth2 import SpotifyClientCredentials
 
 # ==========================================
 # CONFIGURACIÓN
@@ -22,19 +21,14 @@ YT_BATCH_SLEEP = 1.0
 MIN_TRACKS_PER_GENRE = 3
 CREATE_UNCLASSIFIED_PLAYLIST = False
 
-# --- CONFIGURACIÓN DE SPOTIFY (Respaldo seguro mediante variables de entorno) ---
-sp_client_id = os.getenv("SPOTIPY_CLIENT_ID")
-sp_client_secret = os.getenv("SPOTIPY_CLIENT_SECRET")
-
-sp = None
-if sp_client_id and sp_client_secret:
-    try:
-        auth_manager = SpotifyClientCredentials(
-            client_id=sp_client_id, client_secret=sp_client_secret
-        )
-        sp = spotipy.Spotify(auth_manager=auth_manager)
-    except Exception as e:
-        print(f"Aviso: No se pudo inicializar Spotify: {e}")
+MUSICBRAINZ_CONTACT = os.getenv(
+    "MUSICBRAINZ_CONTACT_EMAIL",
+    "https://github.com/marianoali-maker/organizador-ytmusic",
+)
+musicbrainzngs.set_useragent(
+    "OrganizadorYTMusic", "1.0", MUSICBRAINZ_CONTACT)
+musicbrainzngs.set_rate_limit(1.0)
+MUSICBRAINZ_ARTIST_CACHE = {}
 
 # Mapeo directo por Artistas (Máxima prioridad)
 ARTIST_MAP = {
@@ -126,7 +120,7 @@ GENRE_PRIORITY = [
     ('synthpop', 'Synthpop'),
     ('banda sonora', 'Bandas Sonoras'),
     ('soundtrack', 'Bandas Sonoras'),
-    # Subgéneros específicos añadidos para Spotify / Niche
+    # Subgéneros específicos
     ('k-pop', 'K-Pop'),
     ('j-pop', 'J-Pop'),
     ('k-rap', 'Hip-Hop'),
@@ -183,7 +177,7 @@ GENRE_PRIORITY = [
 BLACKLIST_TAGS = {
     'seen live', 'favorites', 'favourite', 'favorite', 'love', 'loved',
     'awesome', 'amazing', 'cool', 'good', 'great', 'beautiful', 'best',
-    'spotify', 'lastfm', 'last.fm', 'youtube', 'youtube music',
+    'lastfm', 'last.fm', 'youtube', 'youtube music',
     'my music', 'my favorites', 'chill', 'chillout', 'relax', 'mellow',
     'party', 'dance', 'happy', 'sad', 'summer', 'winter', 'night',
     'male vocalists', 'female vocalists', 'vocal', 'instrumental',
@@ -281,23 +275,55 @@ class LastFMClient:
         return self.extract_genre_from_tags(tags)
 
 
-def lookup_spotify_genre(artist):
-    """Consulta los géneros del artista en Spotify como sistema de respaldo."""
-    if not sp:
+def lookup_musicbrainz_genre(artist):
+    """Consulta las etiquetas del artista en MusicBrainz como respaldo."""
+    if not artist:
         return None
+    artist_key = artist.casefold()
+    if artist_key in MUSICBRAINZ_ARTIST_CACHE:
+        return MUSICBRAINZ_ARTIST_CACHE[artist_key]
+
+    clean_artist = re.sub(r"[\(\[].*?[\)\]]", "", artist).strip()
+    if not clean_artist:
+        return None
+
     try:
-        resultado = sp.search(q=f"artist:{artist}", type="artist", limit=1)
-        items = resultado.get("artists", {}).get("items", [])
-        if items and items[0].get("genres"):
-            artist_genres = " ".join(items[0]["genres"]).lower()
-            for keyword, canonical in GENRE_PRIORITY:
-                if re.search(r'\b' + re.escape(keyword) + r'\b', artist_genres):
-                    return canonical
-            # Si tiene géneros en Spotify pero ninguno hizo match directo con la prioridad, devuelve el primero capitalizado
-            return items[0]["genres"][0].title()
-    except Exception as e:
-        print(f"Error consultando Spotify para el artista {artist}: {e}")
-    return None
+        resultado = musicbrainzngs.search_artists(
+            artist=clean_artist, limit=5)
+    except (musicbrainzngs.WebServiceError, musicbrainzngs.NetworkError,
+            musicbrainzngs.UsageError) as e:
+        print(f"[MusicBrainz] Error consultando '{artist}': {e}")
+        MUSICBRAINZ_ARTIST_CACHE[artist_key] = None
+        return None
+
+    items = resultado.get('artist-list', [])
+    genre = None
+    if items:
+        normalized_artist = re.sub(r"\W+", "", clean_artist.casefold())
+        matching_artist = next(
+            (
+                item for item in items
+                if re.sub(r"\W+", "", (item.get("name") or "").casefold())
+                == normalized_artist
+            ),
+            items[0],
+        )
+        tags = matching_artist.get('tag-list') or []
+        tag_names = [
+            tag.get('name', '').strip().lower()
+            for tag in tags
+            if isinstance(tag, dict) and tag.get('name')
+        ]
+        all_tags_text = " ".join(tag_names)
+        for keyword, canonical in GENRE_PRIORITY:
+            if re.search(r'\b' + re.escape(keyword) + r'\b', all_tags_text):
+                genre = canonical
+                break
+        if not genre and tag_names:
+            genre = tag_names[0].title()
+
+    MUSICBRAINZ_ARTIST_CACHE[artist_key] = genre
+    return genre
 
 
 def clean_title(title):
@@ -347,9 +373,9 @@ def classify(lastfm, artist, track, album, cache):
     if not genre:
         genre = lastfm.lookup_artist(artist)
 
-    # 4. Si Last.fm falla, consultar Spotify como respaldo automático
+    # 4. Si Last.fm falla, consultar MusicBrainz como respaldo
     if not genre:
-        genre = lookup_spotify_genre(artist)
+        genre = lookup_musicbrainz_genre(artist)
 
     if not genre:
         genre = 'Sin clasificar'
