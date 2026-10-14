@@ -117,6 +117,17 @@ DEFAULT_MAX_ADDS = 150
 MAX_CONSECUTIVE_FAILURES = 5
 
 ARTIST_MAP = {
+    'antdot': 'House',
+    'koli arce': 'Cumbia',
+    'malagata': 'Cumbia',
+    'aclamado amistad': 'Cumbia',
+    'los del maranaho': 'Cumbia',
+    'los dora 2': 'Cumbia',
+    'grupo trinidad': 'Cumbia',
+    'siete lunas': 'Cumbia',
+    'media naranja': 'Cumbia',
+    'dj andres cruz': 'Deep House',
+    'lyna vallejos': 'Otros',
     'los del fuego': 'Cumbia',
     'el combo loco': 'Cumbia',
     'tinta roja': 'Cumbia',
