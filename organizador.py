@@ -33,6 +33,16 @@ MUSICBRAINZ_ARTIST_CACHE = {}
 # Mapeo directo por Artistas (Máxima prioridad)
 ARTIST_MAP = {
     # Cumbia y Tropical
+    'los angeles azules': 'Cumbia',
+    'koli arce': 'Cumbia',
+    'malagata': 'Cumbia',
+    'aclamado amistad': 'Cumbia',
+    'los del maranaho': 'Cumbia',
+    'los dora 2': 'Cumbia',
+    'grupo trinidad': 'Cumbia',
+    'siete lunas': 'Cumbia',
+    'media naranja': 'Cumbia',
+    'la nueva luna': 'Cumbia',
     'los del fuego': 'Cumbia',
     'el combo loco': 'Cumbia',
     'tinta roja': 'Cumbia',
@@ -73,6 +83,7 @@ ARTIST_MAP = {
     'trulala': 'Cuarteto',
 
     # House / Afro House / Electrónica
+    'dj andres cruz': 'Deep House',
     'yamore': 'Afro House',
     'salif keita': 'Afro House',
     'cesaria evora': 'Afro House',
