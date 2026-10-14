@@ -480,6 +480,33 @@ def new_spotify_stats():
     }
 
 
+def format_spotify_error(exc):
+    """Devuelve el motivo de Spotify sin incluir la URL ni credenciales."""
+    response = exc.response
+    if response is None:
+        return f"{type(exc).__name__}: {exc}"[:150]
+
+    detail = ""
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            detail = str(error.get("message") or "")
+        elif error:
+            detail = str(error)
+    if not detail:
+        detail = (response.text or "").strip()
+
+    message = f"HTTP {response.status_code}"
+    if detail:
+        message = f"{message}: {detail}"
+    return f"Spotify {message}"[:150]
+
+
 def get_spotify_access_token(stats):
     """Obtiene y reutiliza un token de aplicación para las búsquedas de Spotify."""
     if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET:
@@ -498,7 +525,7 @@ def get_spotify_access_token(stats):
         data = response.json()
     except requests.RequestException as exc:
         stats["errors"] += 1
-        stats["last_error"] = f"{type(exc).__name__}: {exc}"[:150]
+        stats["last_error"] = format_spotify_error(exc)
         return None
     except ValueError:
         stats["errors"] += 1
@@ -545,7 +572,7 @@ def lookup_spotify_genre(artist, stats):
         data = response.json()
     except requests.RequestException as exc:
         stats["errors"] += 1
-        stats["last_error"] = f"{type(exc).__name__}: {exc}"[:150]
+        stats["last_error"] = format_spotify_error(exc)
         return None
     except ValueError:
         stats["errors"] += 1
