@@ -7,6 +7,8 @@ import time
 import requests
 import streamlit as st
 import musicbrainzngs
+from ytmusicapi import LikeStatus, OAuthCredentials, YTMusic
+from ytmusicapi.exceptions import YTMusicError
 
 # ==========================================
 # CONFIGURACIÓN DE PÁGINA Y ESTILOS YOUTUBE MUSIC
@@ -113,6 +115,8 @@ musicbrainzngs.set_rate_limit(1.0)
 
 LASTFM_SLEEP = 0.25
 YT_INSERT_SLEEP = 0.3
+YT_LIKE_VERIFY_ATTEMPTS = 3
+YT_LIKE_VERIFY_SLEEP = 0.5
 MIN_TRACKS_PER_GENRE = 3
 MIX_PLAYLIST_TITLE = "Mix por género"
 DEFAULT_MAX_ADDS = 150
@@ -357,6 +361,20 @@ def fetch_my_playlists():
     return {it["snippet"]["title"]: it["id"] for it in items}
 
 
+def fetch_existing_genre_assignments():
+    """Uses existing genre playlists as durable manual classification."""
+    existing = fetch_my_playlists()
+    assignments = {}
+    genres = [
+        name for name in existing
+        if name in GENRE_CHOICES and name != OMIT_LABEL
+    ]
+    for genre in genres:
+        for video_id in fetch_playlist_video_ids_ordered(existing[genre]):
+            assignments.setdefault(video_id, genre)
+    return assignments
+
+
 def fetch_playlist_video_ids(playlist_id):
     return set(fetch_playlist_video_ids_ordered(playlist_id))
 
@@ -398,20 +416,61 @@ def add_video_to_playlist(playlist_id, video_id):
 
 
 def remove_likes(video_ids):
-    removed = 0
+    if not video_ids:
+        return 0, []
+
+    try:
+        get_access_token()
+        credentials = json.loads(st.session_state["yt_credentials"])
+        ytmusic = YTMusic(
+            auth=credentials,
+            oauth_credentials=OAuthCredentials(YT_CLIENT_ID, YT_CLIENT_SECRET),
+            language="es",
+        )
+    except (YouTubeAPIError, YTMusicError, requests.RequestException,
+            json.JSONDecodeError) as exc:
+        return 0, [(video_id, str(exc)) for video_id in video_ids]
+
+    requested_ids = []
     failures = []
-    for index, video_id in enumerate(video_ids):
+    for video_id in video_ids:
         try:
-            yt_request(
-                "POST", "videos/rate",
-                {"id": video_id, "rating": "none"})
-        except YouTubeAPIError as exc:
-            failures.append((video_id, exc.message))
-            if isinstance(exc, QuotaExceeded):
-                failures.extend(
-                    (remaining_id, "Se agotó la cuota antes de procesar este like.")
-                    for remaining_id in video_ids[index + 1:])
-                break
+            ytmusic.rate_song(video_id, LikeStatus.INDIFFERENT)
+        except (YTMusicError, requests.RequestException) as exc:
+            failures.append((video_id, str(exc)))
+            continue
+        else:
+            requested_ids.append(video_id)
+
+    if not requested_ids:
+        return 0, failures
+
+    still_liked = set(requested_ids)
+    for attempt in range(YT_LIKE_VERIFY_ATTEMPTS):
+        try:
+            liked_songs = ytmusic.get_liked_songs(limit=None).get("tracks", [])
+        except (YTMusicError, requests.RequestException) as exc:
+            failures.extend(
+                (video_id, f"No se pudo verificar la lista 'Me gusta': {exc}")
+                for video_id in requested_ids
+            )
+            return 0, failures
+        still_liked = {
+            track.get("videoId") for track in liked_songs
+            if track.get("videoId")
+        } & set(requested_ids)
+        if not still_liked:
+            break
+        if attempt < YT_LIKE_VERIFY_ATTEMPTS - 1:
+            time.sleep(YT_LIKE_VERIFY_SLEEP)
+
+    removed = 0
+    for video_id in requested_ids:
+        if video_id in still_liked:
+            failures.append((
+                video_id,
+                "YouTube Music todavía lo devuelve en 'Música que me gusta'.",
+            ))
         else:
             removed += 1
     return removed, failures
@@ -644,13 +703,9 @@ def sync_playlists(genre_map, max_adds, status_text, results, summary,
     included_genres = []
 
     for genre, ids in genre_map.items():
-        if genre == 'Sin clasificar' or len(ids) < min_tracks:
+        if genre == 'Sin clasificar':
             continue
         included_genres.append(genre)
-        if remaining <= 0:
-            summary["limit_reached"] = True
-            break
-
         playlist_id = existing.get(genre)
         current_ids = fetch_playlist_video_ids(
             playlist_id) if playlist_id else set()
@@ -659,6 +714,11 @@ def sync_playlists(genre_map, max_adds, status_text, results, summary,
         results.setdefault(genre, 0)
         if not new_ids:
             continue
+        if len(ids) < min_tracks and not playlist_id:
+            continue
+        if remaining <= 0:
+            summary["limit_reached"] = True
+            break
 
         if not playlist_id:
             playlist_id = create_playlist(genre, f"Auto-generada ({genre})")
@@ -718,9 +778,12 @@ def organizar(max_adds, progress_bar, status_text, results):
     lastfm_stats = new_lastfm_stats()
     musicbrainz_stats = new_musicbrainz_stats()
     unclassified_list = []
+    existing_genres = fetch_existing_genre_assignments()
     for i, track in enumerate(tracks, 1):
         clean_t = clean_title(track["title"])
-        genre = classify_local(track["artist"], clean_t, "")
+        genre = existing_genres.get(track["videoId"])
+        if not genre:
+            genre = classify_local(track["artist"], clean_t, "")
         if not genre:
             genre, seen_tags = lookup_lastfm(
                 track["artist"], clean_t, lastfm_stats)
