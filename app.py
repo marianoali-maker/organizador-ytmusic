@@ -368,6 +368,20 @@ def fetch_playlist_video_ids_ordered(playlist_id):
             for it in items if it.get("contentDetails", {}).get("videoId")]
 
 
+def get_mix_video_ids(playlist_names, existing):
+    mix_ids = []
+    seen_ids = set()
+    for genre in playlist_names:
+        playlist_id = existing.get(genre)
+        if not playlist_id:
+            continue
+        for video_id in fetch_playlist_video_ids_ordered(playlist_id)[:3]:
+            if video_id not in seen_ids:
+                seen_ids.add(video_id)
+                mix_ids.append(video_id)
+    return mix_ids
+
+
 def create_playlist(title, description):
     data = yt_request(
         "POST", "playlists", {"part": "snippet,status"},
@@ -401,6 +415,49 @@ def remove_likes(video_ids):
         else:
             removed += 1
     return removed, failures
+
+
+def sync_mix_playlist(genre_names, existing, remaining, status_text,
+                      results, summary):
+    """Adds up to three tracks per genre to a randomly ordered mix playlist."""
+    mix_ids = get_mix_video_ids(genre_names, existing)
+    if not mix_ids:
+        return remaining, 0
+
+    playlist_id = existing.get(MIX_PLAYLIST_TITLE)
+    if not playlist_id:
+        playlist_id = create_playlist(
+            MIX_PLAYLIST_TITLE,
+            "Tres canciones de cada género, en orden aleatorio.")
+        existing[MIX_PLAYLIST_TITLE] = playlist_id
+
+    current_mix_ids = fetch_playlist_video_ids(playlist_id)
+    new_ids = [video_id for video_id in mix_ids
+               if video_id not in current_mix_ids]
+    random.shuffle(new_ids)
+    results.setdefault(MIX_PLAYLIST_TITLE, 0)
+    consecutive_failures = 0
+    for video_id in new_ids:
+        if remaining <= 0:
+            summary["limit_reached"] = True
+            break
+        status_text.text(f"Agregando canciones al '{MIX_PLAYLIST_TITLE}'...")
+        try:
+            add_video_to_playlist(playlist_id, video_id)
+        except QuotaExceeded:
+            raise
+        except YouTubeAPIError as exc:
+            summary["failed"] += 1
+            summary["last_error"] = exc.message
+            consecutive_failures += 1
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                raise
+            continue
+        consecutive_failures = 0
+        results[MIX_PLAYLIST_TITLE] += 1
+        remaining -= 1
+        time.sleep(YT_INSERT_SLEEP)
+    return remaining, len(mix_ids)
 
 
 # ==========================================
@@ -631,48 +688,8 @@ def sync_playlists(genre_map, max_adds, status_text, results, summary,
             remaining -= 1
             time.sleep(YT_INSERT_SLEEP)
 
-    mix_ids = []
-    seen_mix_ids = set()
-    for genre in included_genres:
-        playlist_id = existing.get(genre)
-        if not playlist_id:
-            continue
-        for video_id in fetch_playlist_video_ids_ordered(playlist_id)[:3]:
-            if video_id not in seen_mix_ids:
-                seen_mix_ids.add(video_id)
-                mix_ids.append(video_id)
-
-    if mix_ids:
-        playlist_id = existing.get(MIX_PLAYLIST_TITLE)
-        if not playlist_id:
-            playlist_id = create_playlist(
-                MIX_PLAYLIST_TITLE, "Tres canciones de cada género, en orden aleatorio.")
-            existing[MIX_PLAYLIST_TITLE] = playlist_id
-        current_mix_ids = fetch_playlist_video_ids(playlist_id)
-        new_mix_ids = [video_id for video_id in mix_ids
-                       if video_id not in current_mix_ids]
-        random.shuffle(new_mix_ids)
-        results.setdefault(MIX_PLAYLIST_TITLE, 0)
-        for video_id in new_mix_ids:
-            if remaining <= 0:
-                summary["limit_reached"] = True
-                break
-            status_text.text(f"Agregando canciones al '{MIX_PLAYLIST_TITLE}'...")
-            try:
-                add_video_to_playlist(playlist_id, video_id)
-            except QuotaExceeded:
-                raise
-            except YouTubeAPIError as exc:
-                summary["failed"] += 1
-                summary["last_error"] = exc.message
-                consecutive_failures += 1
-                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                    raise
-                continue
-            consecutive_failures = 0
-            results[MIX_PLAYLIST_TITLE] += 1
-            remaining -= 1
-            time.sleep(YT_INSERT_SLEEP)
+    remaining, _ = sync_mix_playlist(
+        included_genres, existing, remaining, status_text, results, summary)
 
     return confirmed_ids
 
@@ -934,6 +951,53 @@ else:
                       for g, n in results.items()])
             st.caption(
                 "Un 0 significa que esas canciones ya estaban en la playlist.")
+
+    st.markdown("### 🎲 Mix por género")
+    st.caption(
+        "Reúne hasta las 3 primeras canciones de cada playlist cuyo nombre coincide "
+        "con un género reconocido. Después, abrí la playlist en YouTube Music y usá "
+        "el botón de reproducción aleatoria para escucharla en shuffle.")
+    if st.button("Crear o actualizar Mix por género"):
+        mix_status = st.empty()
+        mix_results = {}
+        mix_summary = {"limit_reached": False, "failed": 0, "last_error": ""}
+        try:
+            existing = fetch_my_playlists()
+            genres = [
+                name for name in existing
+                if name in GENRE_CHOICES and name != OMIT_LABEL
+            ]
+            _, mix_count = sync_mix_playlist(
+                genres, existing, int(max_adds), mix_status,
+                mix_results, mix_summary)
+            if mix_count:
+                st.success(
+                    f"Mix disponible con hasta {mix_count} canciones. "
+                    "Buscá 'Mix por género' en Mi biblioteca > Listas de reproducción.")
+            else:
+                st.info(
+                    "No encontré canciones en las playlists con nombre de género. "
+                    "Primero organizá las canciones o verificá los nombres de tus playlists.")
+            if mix_summary["limit_reached"]:
+                st.warning(
+                    "Se alcanzó el máximo de canciones de esta ejecución. "
+                    "Volvé a tocar el botón para completar el mix.")
+            if mix_summary["failed"]:
+                st.warning(
+                    f"No se pudieron agregar {mix_summary['failed']} canciones. "
+                    f"Último error: {mix_summary['last_error']}")
+        except QuotaExceeded:
+            st.warning(
+                "Se alcanzó la cuota diaria de YouTube. El mix quedó guardado parcialmente; "
+                "volvé a intentarlo cuando se reinicie la cuota.")
+        except YouTubeAPIError as exc:
+            st.error(
+                f"Error de YouTube ({exc.status} {exc.reason}): {exc.message}")
+        finally:
+            mix_status.empty()
+        if mix_results:
+            st.table([{"Playlist": name, "Canciones agregadas": count}
+                      for name, count in mix_results.items()])
 
     # ------------------------------------------
     # ASIGNACIÓN MANUAL DE LO QUE QUEDÓ SIN CLASIFICAR
