@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import re
 import time
 
@@ -113,6 +114,7 @@ musicbrainzngs.set_rate_limit(1.0)
 LASTFM_SLEEP = 0.25
 YT_INSERT_SLEEP = 0.3
 MIN_TRACKS_PER_GENRE = 3
+MIX_PLAYLIST_TITLE = "Mix por género"
 DEFAULT_MAX_ADDS = 150
 MAX_CONSECUTIVE_FAILURES = 5
 
@@ -284,6 +286,8 @@ def yt_request(method, path, params=None, body=None):
         break
 
     if resp.ok:
+        if resp.status_code == 204 or not resp.content:
+            return {}
         return resp.json()
 
     try:
@@ -354,10 +358,14 @@ def fetch_my_playlists():
 
 
 def fetch_playlist_video_ids(playlist_id):
+    return set(fetch_playlist_video_ids_ordered(playlist_id))
+
+
+def fetch_playlist_video_ids_ordered(playlist_id):
     items = yt_list_all("playlistItems", {
         "part": "contentDetails", "playlistId": playlist_id, "maxResults": 50})
-    return {it["contentDetails"]["videoId"]
-            for it in items if it.get("contentDetails", {}).get("videoId")}
+    return [it["contentDetails"]["videoId"]
+            for it in items if it.get("contentDetails", {}).get("videoId")]
 
 
 def create_playlist(title, description):
@@ -373,6 +381,26 @@ def add_video_to_playlist(playlist_id, video_id):
         "POST", "playlistItems", {"part": "snippet"},
         {"snippet": {"playlistId": playlist_id,
                      "resourceId": {"kind": "youtube#video", "videoId": video_id}}})
+
+
+def remove_likes(video_ids):
+    removed = 0
+    failures = []
+    for index, video_id in enumerate(video_ids):
+        try:
+            yt_request(
+                "POST", "videos/rate",
+                {"id": video_id, "rating": "none"})
+        except YouTubeAPIError as exc:
+            failures.append((video_id, exc.message))
+            if isinstance(exc, QuotaExceeded):
+                failures.extend(
+                    (remaining_id, "Se agotó la cuota antes de procesar este like.")
+                    for remaining_id in video_ids[index + 1:])
+                break
+        else:
+            removed += 1
+    return removed, failures
 
 
 # ==========================================
@@ -550,15 +578,18 @@ def lookup_musicbrainz_genre(artist, stats):
 
 def sync_playlists(genre_map, max_adds, status_text, results, summary,
                    min_tracks=MIN_TRACKS_PER_GENRE):
-    """Agrega las canciones de cada género a su playlist (la crea si no existe)."""
+    """Sincroniza playlists por género y arma un mix con sus tres primeros temas."""
     status_text.text("Revisando tus playlists...")
     existing = fetch_my_playlists()
     remaining = int(max_adds)
     consecutive_failures = 0
+    confirmed_ids = set()
+    included_genres = []
 
     for genre, ids in genre_map.items():
         if genre == 'Sin clasificar' or len(ids) < min_tracks:
             continue
+        included_genres.append(genre)
         if remaining <= 0:
             summary["limit_reached"] = True
             break
@@ -566,6 +597,7 @@ def sync_playlists(genre_map, max_adds, status_text, results, summary,
         playlist_id = existing.get(genre)
         current_ids = fetch_playlist_video_ids(
             playlist_id) if playlist_id else set()
+        confirmed_ids.update(set(ids) & current_ids)
         new_ids = [v for v in ids if v not in current_ids]
         results.setdefault(genre, 0)
         if not new_ids:
@@ -595,9 +627,54 @@ def sync_playlists(genre_map, max_adds, status_text, results, summary,
                 continue
             consecutive_failures = 0
             results[genre] += 1
+            confirmed_ids.add(video_id)
             remaining -= 1
             time.sleep(YT_INSERT_SLEEP)
 
+    mix_ids = []
+    seen_mix_ids = set()
+    for genre in included_genres:
+        playlist_id = existing.get(genre)
+        if not playlist_id:
+            continue
+        for video_id in fetch_playlist_video_ids_ordered(playlist_id)[:3]:
+            if video_id not in seen_mix_ids:
+                seen_mix_ids.add(video_id)
+                mix_ids.append(video_id)
+
+    if mix_ids:
+        playlist_id = existing.get(MIX_PLAYLIST_TITLE)
+        if not playlist_id:
+            playlist_id = create_playlist(
+                MIX_PLAYLIST_TITLE, "Tres canciones de cada género, en orden aleatorio.")
+            existing[MIX_PLAYLIST_TITLE] = playlist_id
+        current_mix_ids = fetch_playlist_video_ids(playlist_id)
+        new_mix_ids = [video_id for video_id in mix_ids
+                       if video_id not in current_mix_ids]
+        random.shuffle(new_mix_ids)
+        results.setdefault(MIX_PLAYLIST_TITLE, 0)
+        for video_id in new_mix_ids:
+            if remaining <= 0:
+                summary["limit_reached"] = True
+                break
+            status_text.text(f"Agregando canciones al '{MIX_PLAYLIST_TITLE}'...")
+            try:
+                add_video_to_playlist(playlist_id, video_id)
+            except QuotaExceeded:
+                raise
+            except YouTubeAPIError as exc:
+                summary["failed"] += 1
+                summary["last_error"] = exc.message
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    raise
+                continue
+            consecutive_failures = 0
+            results[MIX_PLAYLIST_TITLE] += 1
+            remaining -= 1
+            time.sleep(YT_INSERT_SLEEP)
+
+    return confirmed_ids
 
 def organizar(max_adds, progress_bar, status_text, results):
     """Clasifica los 'Me gusta' y los agrega a playlists por género.
@@ -607,6 +684,7 @@ def organizar(max_adds, progress_bar, status_text, results):
     """
     summary = {"limit_reached": False, "failed": 0, "last_error": "",
                "unclassified": 0, "tracks": 0,
+               "likes_removed": 0, "like_removal_failures": [],
                "unclassified_list": [], "lastfm": new_lastfm_stats(),
                "musicbrainz": new_musicbrainz_stats()}
 
@@ -651,7 +729,13 @@ def organizar(max_adds, progress_bar, status_text, results):
     summary["lastfm"] = lastfm_stats
     summary["musicbrainz"] = musicbrainz_stats
 
-    sync_playlists(genre_map, max_adds, status_text, results, summary)
+    confirmed_ids = sync_playlists(
+        genre_map, max_adds, status_text, results, summary)
+    liked_ids = {track["videoId"] for track in tracks}
+    ids_to_unlike = [video_id for video_id in liked_ids
+                     if video_id in confirmed_ids]
+    (summary["likes_removed"],
+     summary["like_removal_failures"]) = remove_likes(ids_to_unlike)
     return summary
 
 
@@ -762,6 +846,9 @@ else:
     st.markdown("### 🚀 Iniciar Organización")
     st.caption(
         "Se leen tus videos de música con 'Me gusta' y se agregan a playlists privadas por género. "
+        "Los likes solo se quitan cuando la canción ya quedó en su playlist de género; "
+        "las que no tienen género quedan pendientes para que lo elijas manualmente. "
+        "También se mantiene una playlist 'Mix por género' con hasta tres canciones de cada género. "
         "Cada canción agregada consume cuota de la API de YouTube (unas 50 unidades; el tope diario "
         "por defecto es de 10.000 y se comparte entre todos los usuarios de la app). "
         "Si no alcanza en un día, volvé a ejecutar al siguiente: la app salta lo que ya está en cada playlist.")
@@ -823,10 +910,22 @@ else:
                     st.warning(
                         f"{summary['failed']} canciones no se pudieron agregar "
                         f"(por ejemplo, videos no disponibles). Último error: {summary['last_error']}")
+                st.caption(
+                    f"Likes quitados después de confirmar su playlist de género: "
+                    f"{summary['likes_removed']}.")
+                if summary["like_removal_failures"]:
+                    st.warning(
+                        f"No se pudieron quitar {len(summary['like_removal_failures'])} likes. "
+                        "Esas canciones permanecen con 'Me gusta'. "
+                        f"Último error: {summary['like_removal_failures'][-1][1]}")
                 if summary["limit_reached"]:
                     st.info(
                         "Llegaste al máximo de canciones de esta ejecución. "
                         "Volvé a tocar el botón para seguir con el resto.")
+                elif summary["failed"] or summary["like_removal_failures"]:
+                    st.warning(
+                        "El proceso terminó, pero quedaron acciones pendientes. "
+                        "Revisá los errores indicados y volvé a ejecutar cuando corresponda.")
                 else:
                     st.success("🎉 ¡Organización completada!")
 
@@ -860,7 +959,8 @@ else:
         st.markdown("### 🧩 Elegí el género de lo que quedó sin clasificar")
         st.caption(
             "Asigná un género a cada artista (o dejá 'Omitir'). Sus canciones se agregan a la "
-            "playlist de ese género, que se crea si no existe. Cuenta para el máximo de arriba.")
+            "playlist de ese género, que se crea si no existe. Los likes se quitan solo después "
+            "de confirmar la adición. Cuenta para el máximo de arriba.")
         with st.form("manual_genres"):
             for artist, items in by_artist.items():
                 tags = items[0]["tags"] or "sin etiquetas"
@@ -886,11 +986,11 @@ else:
                 manual_summary = {"limit_reached": False,
                                   "failed": 0, "last_error": ""}
                 holder = st.empty()
-                done = False
+                confirmed_ids = set()
                 try:
-                    sync_playlists(genre_map, max_adds, holder, manual_results,
-                                   manual_summary, min_tracks=1)
-                    done = not manual_summary["limit_reached"]
+                    confirmed_ids = sync_playlists(
+                        genre_map, max_adds, holder, manual_results,
+                        manual_summary, min_tracks=1)
                 except QuotaExceeded:
                     messages.append((
                         "warning",
@@ -905,18 +1005,28 @@ else:
                         "warning",
                         f"{manual_summary['failed']} canciones no se pudieron agregar. "
                         f"Último error: {manual_summary['last_error']}"))
+                ids_to_unlike = sorted(confirmed_ids)
+                likes_removed, like_failures = remove_likes(ids_to_unlike)
+                if likes_removed:
+                    messages.append((
+                        "success",
+                        f"Se quitaron los likes de {likes_removed} canciones ya agregadas."))
+                if like_failures:
+                    messages.append((
+                        "warning",
+                        f"No se pudieron quitar {len(like_failures)} likes; "
+                        "esas canciones siguen con 'Me gusta'. "
+                        f"Último error: {like_failures[-1][1]}"))
                 if manual_summary["limit_reached"]:
                     messages.append((
                         "info",
                         "Llegaste al máximo de canciones de esta ejecución. "
                         "Volvé a enviar para seguir con el resto."))
-                if done:
+                if confirmed_ids:
                     messages.append(
-                        ("success", "¡Listo! Las canciones se agregaron a sus playlists."))
-                    assigned_ids = {i["videoId"]
-                                    for a in assigned for i in by_artist[a]}
+                        ("success", "Se procesaron las canciones que quedaron confirmadas en sus playlists."))
                     st.session_state["pending_unclassified"] = [
-                        i for i in pending if i["videoId"] not in assigned_ids]
+                        i for i in pending if i["videoId"] not in confirmed_ids]
                 st.session_state["manual_report"] = {
                     "messages": messages,
                     "results": [{"Género": g, "Canciones agregadas": n}

@@ -2,6 +2,10 @@
 
 Aplicación Streamlit que clasifica canciones de la biblioteca autorizada y crea playlists privadas por género.
 
+Al organizar, se quita el "Me gusta" únicamente después de confirmar que la canción está en su playlist de género. Las canciones sin género quedan con el like hasta que se les asigne uno manualmente; en Streamlit se elige desde la sección de pendientes y, al ejecutar `organizador.py`, se puede ingresar el género o presionar ENTER para dejar la canción pendiente. Quitar el like no elimina la canción de la biblioteca.
+
+También se crea o actualiza la playlist privada **Mix por género** con hasta las tres primeras canciones de cada playlist de género, en orden aleatorio. Para no borrar cambios del usuario, las ejecuciones posteriores agregan canciones faltantes sin reemplazar las ya existentes.
+
 ## Despliegue en Streamlit Community Cloud
 
 1. Subí el repositorio a GitHub sin incluir credenciales ni archivos de autenticación.
