@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import re
 import time
 import requests
@@ -20,6 +21,7 @@ YT_BATCH_SIZE = 50
 YT_BATCH_SLEEP = 1.0
 MIN_TRACKS_PER_GENRE = 3
 CREATE_UNCLASSIFIED_PLAYLIST = False
+MIX_PLAYLIST_TITLE = 'Mix por género'
 
 MUSICBRAINZ_CONTACT = os.getenv(
     "MUSICBRAINZ_CONTACT_EMAIL",
@@ -369,6 +371,10 @@ def classify_local(artist, title, album):
 def classify(lastfm, artist, track, album, cache):
     key = f"{artist.lower()}||{track.lower()}"
 
+    manual_genre = cache.get(key)
+    if isinstance(manual_genre, str) and manual_genre.startswith('manual::'):
+        return manual_genre.removeprefix('manual::')
+
     # 1. Reglas locales y mapa directo de artistas tienen máxima prioridad
     genre = classify_local(artist, track, album)
     if genre:
@@ -457,6 +463,49 @@ def get_or_create_playlist(yt, title, existing_playlists):
     return pl_id
 
 
+def create_mix_playlist(yt, genre_names, existing_playlists):
+    mix_ids = []
+    seen_ids = set()
+    for genre in genre_names:
+        playlist_id = existing_playlists.get(genre)
+        if not playlist_id:
+            continue
+        try:
+            playlist = yt.get_playlist(playlist_id, limit=None)
+        except Exception as e:
+            print(f"  Error leyendo playlist '{genre}' para el mix: {e}")
+            continue
+        for track in playlist.get('tracks', [])[:3]:
+            video_id = track.get('videoId')
+            if video_id and video_id not in seen_ids:
+                seen_ids.add(video_id)
+                mix_ids.append(video_id)
+
+    if not mix_ids:
+        print("No hay canciones disponibles para crear el mix.")
+        return
+
+    random.shuffle(mix_ids)
+    mix_id = get_or_create_playlist(yt, MIX_PLAYLIST_TITLE, existing_playlists)
+    current_ids = fetch_existing_playlist_tracks(yt, mix_id)
+    new_ids = [video_id for video_id in mix_ids if video_id not in current_ids]
+    if not new_ids:
+        print(f"'{MIX_PLAYLIST_TITLE}': sin canciones nuevas.")
+        return
+
+    print(f"'{MIX_PLAYLIST_TITLE}': agregando {len(new_ids)} canciones...")
+    for start in range(0, len(new_ids), YT_BATCH_SIZE):
+        batch = new_ids[start:start + YT_BATCH_SIZE]
+        try:
+            result = yt.add_playlist_items(mix_id, batch)
+        except Exception as e:
+            print(f"  Error agregando canciones al mix: {e}")
+            continue
+        if not isinstance(result, dict) or 'SUCCEEDED' not in result.get('status', ''):
+            print(f"  YouTube no confirmó la adición al mix: {result}")
+        time.sleep(YT_BATCH_SLEEP)
+
+
 def process_library(yt, lastfm):
     cache = load_cache()
 
@@ -475,12 +524,16 @@ def process_library(yt, lastfm):
         if vid and vid not in seen_ids:
             seen_ids.add(vid)
             tracks.append(track)
+    liked_ids = {
+        track.get('videoId') for track in liked_tracks if track.get('videoId')
+    }
 
     print(f"{len(tracks)} canciones únicas encontradas.")
     if not tracks:
         return
 
     genre_map = {}
+    manual_genre_ids = set()
     for i, track in enumerate(tracks, 1):
         title = track.get('title') or ''
         artists = track.get('artists') or []
@@ -493,6 +546,18 @@ def process_library(yt, lastfm):
             continue
 
         genre = classify(lastfm, artist, clean_title(title), album, cache)
+        if genre == 'Sin clasificar' and vid in liked_ids:
+            print(
+                f"\nNo se detectó el género de '{artist} - {title}'. "
+                "El like se conservará hasta que se asigne un género.")
+            manual_genre = input(
+                "Ingresá el género (ENTER para dejarlo pendiente): ").strip()
+            if manual_genre and manual_genre.casefold() != 'sin clasificar':
+                genre = manual_genre
+                cache[f"{artist.lower()}||{clean_title(title).lower()}"] = (
+                    f"manual::{genre}")
+                manual_genre_ids.add(vid)
+                save_cache(cache)
         genre_map.setdefault(genre, []).append(vid)
 
         if i % 25 == 0 or i == len(tracks):
@@ -508,34 +573,65 @@ def process_library(yt, lastfm):
 
     playlists = yt.get_library_playlists()
     existing = {pl['title']: pl['playlistId'] for pl in playlists}
+    placed_ids = set()
+    included_genres = []
 
     for genre, ids in sorted(genre_map.items(), key=lambda x: -len(x[1])):
         if genre == 'Sin clasificar' and not CREATE_UNCLASSIFIED_PLAYLIST:
+            print(f"'{genre}': se conserva el like hasta asignar un género.")
             continue
 
-        if len(ids) < MIN_TRACKS_PER_GENRE:
+        manually_assigned = set(ids) & manual_genre_ids
+        if len(ids) < MIN_TRACKS_PER_GENRE and not manually_assigned:
             print(
                 f"'{genre}': omitido ({len(ids)} temas, mínimo requerido: {MIN_TRACKS_PER_GENRE}).")
             continue
 
         pl_id = get_or_create_playlist(yt, genre, existing)
         current = fetch_existing_playlist_tracks(yt, pl_id)
+        placed_ids.update(set(ids) & current)
         new_ids = [v for v in ids if v not in current]
 
         if not new_ids:
             print(f"'{genre}': sin canciones nuevas.")
+            included_genres.append(genre)
             continue
 
         print(f"'{genre}': agregando {len(new_ids)} canciones...")
+        genre_added = False
         for i in range(0, len(new_ids), YT_BATCH_SIZE):
             batch = new_ids[i:i + YT_BATCH_SIZE]
             try:
-                yt.add_playlist_items(pl_id, batch)
+                result = yt.add_playlist_items(pl_id, batch)
             except Exception as e:
                 print(f"  Error agregando lote: {e}")
+                continue
+            if isinstance(result, dict) and 'SUCCEEDED' in result.get('status', ''):
+                placed_ids.update(batch)
+                genre_added = True
+            else:
+                print(f"  YouTube no confirmó el lote: {result}")
             time.sleep(YT_BATCH_SLEEP)
+        if genre_added or set(ids).issubset(placed_ids):
+            included_genres.append(genre)
 
-    print("\nProceso finalizado con éxito.")
+    create_mix_playlist(yt, included_genres, existing)
+
+    liked_to_remove = liked_ids & placed_ids
+    if liked_to_remove:
+        print(f"\nQuitando likes de {len(liked_to_remove)} canciones ya guardadas por género...")
+        for video_id in liked_to_remove:
+            try:
+                yt.rate_song(video_id, 'INDIFFERENT')
+            except Exception as e:
+                print(f"  No se pudo quitar el like de {video_id}: {e}")
+    unclassified_liked = liked_ids - placed_ids
+    if unclassified_liked:
+        print(
+            f"Se conservaron {len(unclassified_liked)} likes porque esas canciones "
+            "no quedaron agregadas a una playlist de género.")
+
+    print("\nProceso finalizado.")
 
 
 if __name__ == "__main__":
